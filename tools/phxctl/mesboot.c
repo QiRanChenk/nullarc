@@ -748,7 +748,15 @@ int main(int argc, char **argv)
    if (all || !strcmp(argv[1], "gart")) gart();
    if (all || !strcmp(argv[1], "mes")) mes_start();
    if (!strcmp(argv[1], "kiqdb")) { use_db = 1; kiq_test(); }
-   if (!strcmp(argv[1], "kiqsched")) { kiq_init_only(); sched_test(); }
+   if (!strcmp(argv[1], "kiqsched")) {
+      // CP_MEC_DOORBELL_RANGE_LOWER/UPPER as gfx_v11_0_cp_set_doorbell_range: the compute range must end below the gfx
+      // doorbell (0x458). The reset value (0x110..0xffc) covers it, so the first gfx doorbell also lands in the compute
+      // fetcher, which never finishes with it: CP_CPF_STATUS stays POST_WPTR_GFX_BUSY | CPF_CMP_BUSY | CPF_BUSY and
+      // GRBM_STATUS GUI_ACTIVE | CP_BUSY | ANY_ACTIVE (0xa800302c, Linux idles at 0x0000302c). The GFX core then never
+      // reports idle, which blocks GFXOFF and coarse clock gating. It has to be written before that first doorbell.
+      wr(SEG0(0x1dfc), 0); wr(SEG0(0x1dfd), 0x450);
+      kiq_init_only(); sched_test();
+   }
    if (!strcmp(argv[1], "claim")) {   // GPU is up: let PhxAccel (the Metal accelerator) start on it
       uint64_t in[1] = {1};
       printf("claim -> kr 0x%x\n", IOConnectCallScalarMethod(conn, 113, in, 1, NULL, NULL));
