@@ -922,23 +922,38 @@ static int nvmtl_surface_image_create(NVMTLTexture *t, IOSurfaceRef surf, NSUInt
     static int hostOn = -1;
     if (hostOn < 0) hostOn = nvmtl_vk_vendor() == 0x1002 && !getenv("NVMTL_NO_SURFACE_HOST");
     nvk_buffer copyBuf = { 0 }; size_t copyRow = 0;   // the imported pages, kept for a private image's GPU copies
-    if (hostOn && surf && plane == 0 && IOSurfaceGetPlaneCount(surf) <= 1) {
+    // A plane of a multi-plane surface (a camera's 420v frame: R8 luma and RG8 chroma) is imported the same way, as a
+    // linear image at the plane's offset in the surface's allocation. It used to get a private image copied in and out
+    // through the CPU, which is not ordered against the other users of the surface: VideoToolbox's Metal transfer
+    // draws a frame into the planes and the next stage read the surface while its rows were still being copied back.
+    // Tencent Meeting's camera preview showed bands of stale rows in most frames. NVMTL_NO_SURFACE_HOST_PLANES=1 keeps
+    // the copies for planes.
+    static int planesOn = -1;
+    if (planesOn < 0) planesOn = !getenv("NVMTL_NO_SURFACE_HOST_PLANES");
+    const size_t nplanes = surf ? IOSurfaceGetPlaneCount(surf) : 0;
+    const int multi = nplanes > 1;
+    if (hostOn && surf && (multi ? (planesOn && plane < nplanes) : plane == 0)) {
         void *base = IOSurfaceGetBaseAddress(surf);
-        const size_t row = IOSurfaceGetBytesPerRow(surf), sh = IOSurfaceGetHeight(surf), al = nvmtl_vk_host_import_align();
+        void *pbase = multi ? IOSurfaceGetBaseAddressOfPlane(surf, plane) : base;
+        const size_t row = multi ? IOSurfaceGetBytesPerRowOfPlane(surf, plane) : IOSurfaceGetBytesPerRow(surf);
+        const size_t sh = multi ? IOSurfaceGetHeightOfPlane(surf, plane) : IOSurfaceGetHeight(surf), al = nvmtl_vk_host_import_align();
+        const size_t off = (base && pbase && (uintptr_t)pbase >= (uintptr_t)base) ? (size_t)((uintptr_t)pbase - (uintptr_t)base) : SIZE_MAX;
         // the surface is mapped in whole pages: its allocation rounded up to the import alignment is still its own
         const size_t alloc = IOSurfaceGetAllocSize(surf), span = al ? (alloc + al - 1) & ~(al - 1) : 0;
-        if (base && al && !((uintptr_t)base & (al - 1)) && alloc && (size_t)w * (bpp ? bpp : 4) <= row
-            && h <= sh && row % 32 == 0 && row * (h - 1) + (size_t)w * (bpp ? bpp : 4) <= alloc) {
+        if (base && al && !((uintptr_t)base & (al - 1)) && alloc && off < alloc && (size_t)w * (bpp ? bpp : 4) <= row
+            && h <= sh && row % 32 == 0 && off + row * (h - 1) + (size_t)w * (bpp ? bpp : 4) <= alloc) {
             nvk_buffer hb;
             if (!nvmtl_vk_buffer_import_host(base, span, &hb)) {
-                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &hb, 0, row, &t->_i)) {
+                if (!nvmtl_vk_image_create_buffer_alias(w, h, vkf, bpp, a8, stex, 1, &hb, off, row, &t->_i)) {
                     t->_hostBuf = hb; t->_hostOn = YES; t->_surfSeed = IOSurfaceGetSeed(surf); t->_surfSynced = YES;
                     static unsigned long long nh; static unsigned said;
                     if (said++ < 8 || ++nh % 2000 == 0)
-                        nvlog("surface %u %ux%u pitch %zu -> its own pages (host import, no copies)", (unsigned)IOSurfaceGetID(surf), w, h, row);
+                        nvlog("surface %u %ux%u plane %lu of %zu pitch %zu offset %zu -> its own pages (host import, no copies)",
+                              (unsigned)IOSurfaceGetID(surf), w, h, (unsigned long)plane, nplanes ? nplanes : 1, row, off);
                     return 0;
                 }
-                copyBuf = hb; copyRow = row;   // no linear image at this pitch (RADV wants 256-byte rows)
+                if (multi) nvmtl_vk_buffer_destroy(&hb);   // a plane's GPU copies would need the offset: the CPU copies stay
+                else { copyBuf = hb; copyRow = row; }      // no linear image at this pitch (RADV wants 256-byte rows)
             }
         }
     }
