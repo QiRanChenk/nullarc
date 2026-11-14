@@ -23,8 +23,9 @@
 #include <kern/clock.h>
 
 #include "PhxNativeABI.h"
+#include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 34u
+#define PHX_KEXT_BUILD 37u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -46,8 +47,98 @@ SYSCTL_INT(_debug, OID_AUTO, phx_hang_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gHangMs,
            "ms without progress before a hung submission's waves are killed (0 off)");
 SYSCTL_INT(_debug, OID_AUTO, phx_hang_kills, CTLFLAG_RD | CTLFLAG_LOCKED, (int *)&gHangKills, 0,
            "hung submissions whose waves were killed");
+// debug.phx_pm_*: SMU 13.0.4 power management. Every phx_pm_ms the SMU copies its metrics table (SmuMetrics_t) into
+// one VRAM page (Linux smu_cmn_update_table) and the values below are refreshed. phx_pm_mode picks the GFX clock policy:
+// 0 = leave the PMFW defaults (telemetry only), 1 = auto (Linux AMD_DPM_FORCED_LEVEL_AUTO: HardMin = min, SoftMax = max,
+// the PMFW scales inside), 2 = governor (the kext moves SoftMax with the GFX load, for PMFWs that do not scale on their
+// own). phx_pm_gfx_max lowers the ceiling (MHz, 0 = the PMFW's DPM table). The floor is always the PMFW's own minimum:
+// a HardMin above it keeps the PMFW from pulling GFXCLK down when the package reaches its PPT/TDC limits, and on battery
+// the EC then cut the power (ACEMAGIC RX16, 2026-11-12: twice, HardMin 2600 under GPU load, ThrottlerStatus
+// FPPT|SPPT|TDC_VDD, package peaks ~60 W; the same load with the PMFW's own choice ran through).
+static int gPmMs = 250;
+static int gPmMode = 0;
+static int gPmGfxMax = 0;
+static int gPmUp = 70;          // governor: GFX busy % that goes straight to the top of the range
+static int gPmTarget = 50;      // governor: busy % a lower cap is sized for (cap = cap * busy / target)
+static int gPmStepDown = 300;   // governor: MHz the cap may fall per tick
+// debug.phx_pm_gfxoff: GFXOFF as Linux does it on GC 11.0.1 (gfx_v11_0_set_powergating_state): RLC_PG_CNTL
+// GFX_POWER_GATING_ENABLE + RLC_PG_DELAY_3 inside RLC safe mode, then SMU AllowGfxOff; the PMFW powers GFX down when it
+// idles and back up on a doorbell. Every GC register access of this kext (VM context binding, TLB invalidation, wave
+// kill, register reads) runs between DisallowGfxOff and a delayed AllowGfxOff (Linux amdgpu_gfx_off_ctrl).
+static int gPmGfxoff = 0;
+static int gPmGfxoffDelayMs = 100;
+static struct {
+    int state;                  // 0 not started, 1 running, -1 not SMU 13.0.4, -2 no VRAM window, -3 driver table refused, -4 gave up
+    int dpmMin, dpmMax;         // the PMFW's GFX range (DpmClocks_t MinGfxClk / MaxGfxClk)
+    int gfxclk, gfxclkAvg, busy, busyAvg, fclkAvg, socclk, memclk;
+    int socketMw, socketMwAvg, coreMwAvg, apuMw, vddMw, socMw;
+    int gfxTemp, socTemp, throttler, c0;
+    int hardMin, softMax;       // what the kext last sent (0 = nothing)
+    int updates, errors, vramWasZero;
+    int gfxoffState;            // 0 off, 1 GFX may power down (AllowGfxOff sent), 2 held on by a register access
+    int gfxWakes, gfxAllows;    // DisallowGfxOff / AllowGfxOff messages sent
+} gPm;
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmMs, 0, "SMU metrics period, ms (0 off)");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_mode, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmMode, 0,
+           "GFX clock policy: 0 PMFW defaults, 1 auto range, 2 kext governor");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_gfx_max, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmGfxMax, 0, "GFX ceiling, MHz (0 DPM table)");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_up, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmUp, 0, "governor: busy % that jumps to max");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_target, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmTarget, 0, "governor: busy % to size the cap for");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_gfxoff, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmGfxoff, 0,
+           "GFXOFF: 1 lets the PMFW power GFX down when idle (RLC power gating + AllowGfxOff)");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_gfxoff_delay_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmGfxoffDelayMs, 0,
+           "GFXOFF: ms after the last GC register access before AllowGfxOff again");
+SYSCTL_INT(_debug, OID_AUTO, phx_pm_step_down, CTLFLAG_RW | CTLFLAG_LOCKED, &gPmStepDown, 0, "governor: MHz down per tick");
+#define PHX_PM_RO(name, field, desc) \
+    SYSCTL_INT(_debug, OID_AUTO, name, CTLFLAG_RD | CTLFLAG_LOCKED, &gPm.field, 0, desc)
+PHX_PM_RO(phx_pm_state, state, "1 running, 0 not started, <0 off (see PhxBringup log)");
+PHX_PM_RO(phx_pm_dpm_min, dpmMin, "PMFW GFX minimum, MHz");
+PHX_PM_RO(phx_pm_dpm_max, dpmMax, "PMFW GFX maximum, MHz");
+PHX_PM_RO(phx_pm_gfxclk, gfxclk, "GFX clock, MHz");
+PHX_PM_RO(phx_pm_gfxclk_avg, gfxclkAvg, "GFX clock, filtered, MHz");
+PHX_PM_RO(phx_pm_busy, busy, "GFX activity, %");
+PHX_PM_RO(phx_pm_busy_avg, busyAvg, "GFX activity, filtered, %");
+PHX_PM_RO(phx_pm_fclk_avg, fclkAvg, "fabric clock, filtered, MHz");
+PHX_PM_RO(phx_pm_socclk, socclk, "SoC clock, MHz");
+PHX_PM_RO(phx_pm_memclk, memclk, "memory clock, MHz");
+PHX_PM_RO(phx_pm_socket_mw, socketMw, "package power, mW");
+PHX_PM_RO(phx_pm_socket_mw_avg, socketMwAvg, "package power, filtered, mW");
+PHX_PM_RO(phx_pm_core_mw_avg, coreMwAvg, "CPU cores power, filtered, mW");
+PHX_PM_RO(phx_pm_apu_mw, apuMw, "APU power, mW");
+PHX_PM_RO(phx_pm_vdd_mw, vddMw, "VDDCR_VDD rail power, mW");
+PHX_PM_RO(phx_pm_soc_mw, socMw, "VDDCR_SOC rail power, mW");
+PHX_PM_RO(phx_pm_gfx_temp, gfxTemp, "GFX temperature, centi-C");
+PHX_PM_RO(phx_pm_soc_temp, socTemp, "SoC temperature, centi-C");
+PHX_PM_RO(phx_pm_throttler, throttler, "ThrottlerStatus bits");
+PHX_PM_RO(phx_pm_c0, c0, "mean AverageCoreC0Residency of the 8 cores (PMFW units)");
+PHX_PM_RO(phx_pm_hardmin, hardMin, "GFX HardMin last sent, MHz");
+PHX_PM_RO(phx_pm_softmax, softMax, "GFX SoftMax last sent, MHz");
+PHX_PM_RO(phx_pm_updates, updates, "metrics tables read");
+PHX_PM_RO(phx_pm_errors, errors, "SMU messages that failed");
+PHX_PM_RO(phx_pm_vram_was_zero, vramWasZero, "the table page was clear before first use");
+PHX_PM_RO(phx_pm_gfxoff_state, gfxoffState, "0 off, 1 GFX may power down, 2 held on for a register access");
+PHX_PM_RO(phx_pm_gfx_wakes, gfxWakes, "DisallowGfxOff sent (GC register access while GFXOFF was allowed)");
+PHX_PM_RO(phx_pm_gfx_allows, gfxAllows, "AllowGfxOff sent");
+static struct sysctl_oid *const kPmOids[] = {
+    &sysctl__debug_phx_pm_ms, &sysctl__debug_phx_pm_mode, &sysctl__debug_phx_pm_gfx_max,
+    &sysctl__debug_phx_pm_up, &sysctl__debug_phx_pm_target, &sysctl__debug_phx_pm_step_down,
+    &sysctl__debug_phx_pm_state, &sysctl__debug_phx_pm_dpm_min, &sysctl__debug_phx_pm_dpm_max,
+    &sysctl__debug_phx_pm_gfxclk, &sysctl__debug_phx_pm_gfxclk_avg, &sysctl__debug_phx_pm_busy,
+    &sysctl__debug_phx_pm_busy_avg, &sysctl__debug_phx_pm_fclk_avg, &sysctl__debug_phx_pm_socclk,
+    &sysctl__debug_phx_pm_memclk, &sysctl__debug_phx_pm_socket_mw, &sysctl__debug_phx_pm_socket_mw_avg,
+    &sysctl__debug_phx_pm_core_mw_avg, &sysctl__debug_phx_pm_apu_mw, &sysctl__debug_phx_pm_vdd_mw,
+    &sysctl__debug_phx_pm_soc_mw, &sysctl__debug_phx_pm_gfx_temp, &sysctl__debug_phx_pm_soc_temp,
+    &sysctl__debug_phx_pm_throttler, &sysctl__debug_phx_pm_c0, &sysctl__debug_phx_pm_hardmin,
+    &sysctl__debug_phx_pm_softmax, &sysctl__debug_phx_pm_updates, &sysctl__debug_phx_pm_errors,
+    &sysctl__debug_phx_pm_vram_was_zero, &sysctl__debug_phx_pm_gfxoff, &sysctl__debug_phx_pm_gfxoff_delay_ms,
+    &sysctl__debug_phx_pm_gfxoff_state, &sysctl__debug_phx_pm_gfx_wakes, &sysctl__debug_phx_pm_gfx_allows,
+};
 // GC 11.0.1 registers (segment 0 base 0x1260, segment 1 base 0xa000)
 static constexpr uint32_t kRegSqCmd = 0x1260 + 0x111b, kRegRlcSafeMode = 0xa000 + 0x0980;
+static constexpr uint32_t kRegRlcPgCntl = 0xa000 + 0x4c43, kRegRlcPgDelay3 = 0xa000 + 0x4c78;
+static constexpr uint32_t kRlcPgGfxPowerGating = 1u << 0, kRlcPgSmuHandshakeDisable = 1u << 23;
+static constexpr uint32_t kRlcPgDelay3Gc1101 = 0x1388;     // RLC_PG_DELAY_3_DEFAULT_GC_11_0_1 (CGPG hysteresis)
+static constexpr uint32_t kGcRegFirst = 0x1260, kGcRegEnd = 0x12000;   // GC segments 0 and 1 (dwords)
 static volatile UInt32 gSysctlUp;
 
 // psp_gfx_rb_frame (64 B) — the ring entry the PSP reads. Only 5 fields are set; the rest stay zero
@@ -212,6 +303,36 @@ private:
     static void hangTick(thread_call_param_t self, thread_call_param_t);
     void hangCheck();
     void killWaves(uint32_t vmid, bool all);
+    // SMU 13.0.4 power management (debug.phx_pm_*): metrics telemetry and the GFX clock policy, on their own timer
+    thread_call_t pmCall{nullptr};
+    volatile bool pmStop{false}, pmResync{false};
+    bool pmReady{false}, pmDead{false};
+    uint16_t pciDeviceId{0};
+    uint32_t pmFails{0}, pmResets{0}, pmTicks{0};
+    int pmModeApplied{0}, pmCap{0};
+    static void pmTick(thread_call_param_t self, thread_call_param_t);
+    void pmStep();
+    bool pmSetup();
+    IOReturn pmTransfer(uint32_t tableId, void *out, uint32_t len);
+    bool pmSend(uint32_t msg, uint32_t arg);
+    bool pmSetRange(int lo, int hi);
+    void pmPolicy(const phx_smu13_0_4_metrics &m);
+    // GFXOFF (debug.phx_pm_gfxoff): gfxAwake/gfxRelease bracket every GC register access; GfxGuard does it per scope
+    mutable IOLock *gfxLock{nullptr};
+    mutable int gfxRef{0};
+    mutable bool gfxOffAllowed{false};
+    mutable uint64_t gfxLastUse{0};
+    bool gfxPgOn{false};
+    bool sleepRef{false};
+    void gfxAwake() const;
+    void gfxRelease() const;
+    void gfxoffPolicy();
+    void rlcSafeMode(bool enter) const;
+    struct GfxGuard {
+        const PhxBringup *p;
+        explicit GfxGuard(const PhxBringup *q) : p(q) { p->gfxAwake(); }
+        ~GfxGuard() { p->gfxRelease(); }
+    };
     bool debug{false};
     bool smuUsed{false};
     volatile SInt32 sessionOpen{0};
@@ -313,6 +434,7 @@ bool PhxBringup::start(IOService *provider) {
     {
         uint16_t v = pci->configRead16(0);
         uint16_t d = pci->configRead16(2);
+        pciDeviceId = d;
         uint8_t rev = pci->configRead8(8);
         uint16_t sv = pci->configRead16(0x2c);
         uint16_t sd = pci->configRead16(0x2e);
@@ -347,6 +469,7 @@ bool PhxBringup::start(IOService *provider) {
     doorbellMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress2);
     smuLock = IOLockAlloc();
     gpuLock = IOLockAlloc();
+    gfxLock = IOLockAlloc();
     uint32_t dbg = 0;
     debug = PE_parse_boot_argn("phxdebug", &dbg, sizeof(dbg)) && dbg == 1;
     if (mmio) {
@@ -371,6 +494,13 @@ bool PhxBringup::start(IOService *provider) {
         clock_interval_to_deadline(500, kMillisecondScale, &d);
         thread_call_enter_delayed(hangCall, d);
     }
+    // power management starts 15 s in: telemetry only unless debug.phx_pm_mode asks for more
+    pmCall = thread_call_allocate(pmTick, this);
+    if (pmCall) {
+        uint64_t d;
+        clock_interval_to_deadline(15000, kMillisecondScale, &d);
+        thread_call_enter_delayed(pmCall, d);
+    }
     registerService();
     return true;
 }
@@ -382,11 +512,25 @@ void PhxBringup::stop(IOService *provider) {
         thread_call_free(hangCall);
         hangCall = nullptr;
     }
+    if (pmCall) {
+        pmStop = true;
+        thread_call_cancel_wait(pmCall);
+        thread_call_free(pmCall);
+        pmCall = nullptr;
+        if (pmReady && pmModeApplied && gPm.dpmMax)
+            pmSetRange(gPm.dpmMin, gPm.dpmMax);   // hand the PMFW its own range back
+        if (gfxPgOn) {
+            gPmGfxoff = 0;
+            gfxoffPolicy();                       // GFX on and RLC power gating off before the kext goes
+        }
+    }
     if (gSysctlUp) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush);
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+        for (struct sysctl_oid *o : kPmOids)
+            sysctl_unregister_oid(o);
         gSysctlUp = 0;
     }
     clearRing();
@@ -427,6 +571,10 @@ void PhxBringup::stop(IOService *provider) {
         IOLockFree(smuLock);
         smuLock = nullptr;
     }
+    if (gfxLock) {
+        IOLockFree(gfxLock);
+        gfxLock = nullptr;
+    }
     PMstop();
     IOService::stop(provider);
 }
@@ -439,6 +587,9 @@ IOReturn PhxBringup::setPowerState(unsigned long ordinal, IOService *whichDevice
         // timeout and fail (loginwindow died in RenderBox one second after a wake, and WindowServer closed with it).
         // Let the GPU finish what it has, then hold new submissions in gpuSubmit().
         isSleeping = true;
+        // GFX stays up, GFXOFF disallowed, from here until the gfx queue has been adopted again: closing the lid with
+        // GFX powered down reset the machine before the hibernation image was written
+        if (!sleepRef) { gfxAwake(); sleepRef = true; }
         if (gpuLock && gpuReady()) {
             for (int i = 0; i < 2000 && gpuRetired() < gSeq; i++)
                 IOSleep(1);
@@ -450,6 +601,7 @@ IOReturn PhxBringup::setPowerState(unsigned long ordinal, IOService *whichDevice
                   static_cast<unsigned long long>(retiredAtSleep), static_cast<unsigned long long>(gSeq));
         }
     } else {
+        pmResync = true;          // the SMU may have lost the driver table address and our limits
         isSleeping = false;
         IOLog("PhxBringup: wake: %s\n", suspended ? "waiting for the bring-up to adopt the queues again" : "nothing held");
     }
@@ -531,6 +683,7 @@ IOReturn PhxBringup::writeReg(uint32_t reg, uint32_t value, uint32_t *readback) 
         return kIOReturnNotReady;
     if ((static_cast<uint64_t>(reg) + 1) * 4 > mmio->getLength())
         return kIOReturnBadArgument;
+    GfxGuard awake(this);
     wreg(reg, value);
     __asm__ __volatile__("mfence" ::: "memory");
     *readback = rreg(reg);
@@ -649,6 +802,7 @@ uint64_t *PhxBringup::vmPte(VmCtx &c, uint64_t va, bool alloc) {
 }
 
 void PhxBringup::vmFlushTlb(uint32_t vmid) const {
+    GfxGuard awake(this);
     __asm__ __volatile__("mfence" ::: "memory");
     wreg(kRegInvEng17Req, 0x00F80000u | (1u << vmid) | 1u);
     for (int i = 0; i < 1000 && !(rreg(kRegInvEng17Ack) & (1u << vmid)); i++)
@@ -718,6 +872,7 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     h.lastUse = now;
     const uint32_t vmid = kFirstUserVmid + static_cast<uint32_t>(pick);
     c.hw = vmid;
+    GfxGuard awake(this);
     wreg(kRegCtx0BaseLo + 2 * vmid, static_cast<uint32_t>(c.phys | 3));
     wreg(kRegCtx0BaseLo + 2 * vmid + 1, static_cast<uint32_t>(c.phys >> 32));
     wreg(kRegCtx0Cntl + vmid, 0x01fffe07);
@@ -773,6 +928,7 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
     // the hibernation image, but the page-table base registers of the hardware VMIDs did not: forget the bindings, so
     // the next submission of each context programs its VMID again (vmBind) instead of running on an unmapped one.
     if (qi == 0) {
+        gfxPgOn = false; gfxOffAllowed = false;   // a fresh bring-up: RLC power gating and the PMFW's allow are gone
         uint32_t n = 0;
         for (uint32_t i = 0; i < kMaxCtx; i++)
             if (vm[i].hw) { vm[i].hw = 0; n++; }
@@ -797,6 +953,7 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
         IOLockWakeup(gpuLock, &resumeEvent, false);
         IOLog("PhxBringup: resume: submissions released\n");
     }
+    if (qi == 1 && sleepRef) { sleepRef = false; gfxRelease(); }
     IOLockUnlock(gpuLock);
     IOLog("PhxBringup: adopted %s queue ring=+0x%llx (%llu dw) wptr=%llu doorbell=+0x%llx\n",
           qi ? "gfx" : "compute", ringOff, ringDw, wptr, dbByte);
@@ -1024,12 +1181,22 @@ void PhxBringup::hangCheck() {
 // gfx_v11_0_ring_soft_recovery: SQ_CMD kill (CMD 3) broadcast (MODE 1), limited to one VMID unless `all`, inside RLC
 // safe mode
 void PhxBringup::killWaves(uint32_t vmid, bool all) {
-    wreg(kRegRlcSafeMode, 0x3);                        // CMD | MESSAGE 1: enter
-    for (int i = 0; i < 1000 && (rreg(kRegRlcSafeMode) & 1); i++)
-        IODelay(1);
+    GfxGuard awake(this);
+    rlcSafeMode(true);
     wreg(kRegSqCmd, 0x13u | (all ? 0u : (0x80u | (vmid & 0xfu) << 28)));
-    wreg(kRegRlcSafeMode, 0x1);                        // CMD, MESSAGE 0: exit
+    rlcSafeMode(false);
     OSIncrementAtomic(&gHangKills);
+}
+
+// gfx_v11_0_set_safe_mode / gfx_v11_0_unset_safe_mode
+void PhxBringup::rlcSafeMode(bool enter) const {
+    if (enter) {
+        wreg(kRegRlcSafeMode, 0x3);                    // CMD | MESSAGE 1: enter
+        for (int i = 0; i < 1000 && (rreg(kRegRlcSafeMode) & 1); i++)
+            IODelay(1);
+    } else {
+        wreg(kRegRlcSafeMode, 0x1);                    // CMD, MESSAGE 0: exit
+    }
 }
 
 IOReturn PhxBringup::doorbellWrite(uint64_t byteOff, uint64_t value) {
@@ -1074,8 +1241,11 @@ IOReturn PhxBringup::pspRing(uint32_t op, uint64_t carveOffset, uint64_t out[4])
         if (ringMc) {
             r = kIOReturnExclusiveAccess;   // a ring is already live; destroy it first
         } else if ((carveOffset & 0xFFF) || carveOffset + PHX_PSP_FENCE_REL + 0x1000 > PHX_VRAM_TMR_OFF ||
-                   PHX_VRAM_FWBUF_OFF + PHX_VRAM_FWBUF_SIZE > fbAperLen) {
-            r = kIOReturnBadArgument;        // ring+cmd+fence must sit below the TMR; fw_buf must fit the aperture
+                   PHX_VRAM_FWBUF_OFF + PHX_VRAM_FWBUF_SIZE > fbAperLen ||
+                   (carveOffset <= PHX_VRAM_SMU_TABLE_OFF &&
+                    PHX_VRAM_SMU_TABLE_OFF < carveOffset + PHX_PSP_FENCE_REL + 0x1000)) {
+            // ring+cmd+fence must sit below the TMR and clear of the SMU table page; fw_buf must fit the aperture
+            r = kIOReturnBadArgument;
         } else {
             volatile uint32_t *ring = reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + carveOffset);
             uint32_t nonzero = 0;
@@ -1332,6 +1502,292 @@ IOReturn PhxBringup::smuMessage(uint32_t msg, uint32_t arg, uint32_t *resp, uint
     return r ? kIOReturnSuccess : kIOReturnTimeout;
 }
 
+// ---- power management (SMU 13.0.4) ----------------------------------------------------------------------------
+// The sequence of Linux smu_v13_0_4_ppt.c / smu_v13_0.c: the driver table's MC address goes to the SMU once
+// (SetDriverDramAddrHigh/Low), then TransferTableSmu2Dram(table id) has the PMFW write a table there. The table page is
+// VRAM (the UMA carve-out); the CPU reads it through BAR0, like the PSP fence.
+
+bool PhxBringup::pmSend(uint32_t msg, uint32_t arg) {
+    uint32_t resp = 0, after = 0;
+    if (smuMessage(msg, arg, &resp, &after) == kIOReturnSuccess && resp == PHX_PPSMC_Result_OK)
+        return true;
+    gPm.errors++;
+    if (gPm.errors <= 8)
+        IOLog("PhxBringup: pm: SMU msg 0x%x arg %u -> resp 0x%x\n", msg, arg, resp);
+    return false;
+}
+
+IOReturn PhxBringup::pmTransfer(uint32_t tableId, void *out, uint32_t len) {
+    if (!pmSend(PHX_PPSMC_TransferTableSmu2Dram, tableId))
+        return kIOReturnError;
+    volatile const uint32_t *src =
+        reinterpret_cast<volatile const uint32_t *>(fbAper->getVirtualAddress() + PHX_VRAM_SMU_TABLE_OFF);
+    uint32_t *dst = static_cast<uint32_t *>(out);
+    for (uint32_t i = 0; i < len / 4; i++)
+        dst[i] = src[i];
+    return kIOReturnSuccess;
+}
+
+bool PhxBringup::pmSetup() {
+    // SMU 13.0.4 only: Phoenix 0x15bf / 0x15c8 and this 780M (0x1900). Raphael (0x164e) speaks SMU 13.0.5.
+    if (pciDeviceId != 0x15bf && pciDeviceId != 0x15c8 && pciDeviceId != 0x1900) {
+        gPm.state = -1;
+        pmDead = true;
+        return false;
+    }
+    if (!mmio || !fbAper || !fbMcBase || PHX_VRAM_SMU_TABLE_OFF + 4096 > fbAperLen) {
+        gPm.state = -2;
+        pmDead = true;
+        return false;
+    }
+    uint32_t ifv = 0, after = 0;
+    if (smuMessage(PHX_PPSMC_GetDriverIfVersion, 0, &ifv, &after) != kIOReturnSuccess || ifv != PHX_PPSMC_Result_OK ||
+        after != PHX_SMU13_0_4_DRIVER_IF_VERSION) {
+        IOLog("PhxBringup: pm: DriverIf resp 0x%x version %u, want %u: off\n", ifv, after,
+              PHX_SMU13_0_4_DRIVER_IF_VERSION);
+        gPm.state = -1;
+        pmDead = true;
+        return false;
+    }
+    volatile uint32_t *page =
+        reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + PHX_VRAM_SMU_TABLE_OFF);
+    uint32_t nonzero = 0;
+    for (uint32_t i = 0; i < 1024; i++)
+        nonzero |= page[i];
+    gPm.vramWasZero = nonzero == 0;
+    for (uint32_t i = 0; i < 1024; i++)
+        page[i] = 0;
+    __asm__ __volatile__("sfence" ::: "memory");
+    (void)page[0];
+    hdpFlush();
+    const uint64_t mc = fbMcBase + PHX_VRAM_SMU_TABLE_OFF;
+    if (!pmSend(PHX_PPSMC_SetDriverDramAddrHigh, static_cast<uint32_t>(mc >> 32)) ||
+        !pmSend(PHX_PPSMC_SetDriverDramAddrLow, static_cast<uint32_t>(mc))) {
+        gPm.state = -3;
+        if (++pmResets >= 5)
+            pmDead = true;
+        return false;
+    }
+    // the GFX range the PMFW allows (Linux smu_v13_0_4_set_fine_grain_gfx_freq_parameters)
+    uint32_t dpm[PHX_SMU_DPMCLOCKS_SIZE / 4];
+    if (pmTransfer(PHX_SMU_TABLE_DPMCLOCKS, dpm, sizeof(dpm)) == kIOReturnSuccess) {
+        uint32_t lo = dpm[PHX_SMU_DPMCLOCKS_MINGFX_OFF / 4], hi = dpm[PHX_SMU_DPMCLOCKS_MINGFX_OFF / 4 + 1];
+        if (lo >= 100 && hi <= 4000 && lo < hi) {
+            gPm.dpmMin = static_cast<int>(lo);
+            gPm.dpmMax = static_cast<int>(hi);
+        }
+    }
+    IOLog("PhxBringup: pm: driver table at MC 0x%llx (page was %s), GFX DPM %d..%d MHz\n",
+          (unsigned long long)mc, gPm.vramWasZero ? "clear" : "dirty", gPm.dpmMin, gPm.dpmMax);
+    pmReady = true;
+    pmFails = 0;
+    gPm.state = 1;
+    return true;
+}
+
+// HardMin <= SoftMax at every step: raising, the ceiling goes first; lowering, the floor.
+bool PhxBringup::pmSetRange(int lo, int hi) {
+    bool ok;
+    if (lo > gPm.softMax && gPm.softMax)
+        ok = pmSend(PHX_PPSMC_SetSoftMaxGfxClk, hi) && pmSend(PHX_PPSMC_SetHardMinGfxClk, lo);
+    else
+        ok = pmSend(PHX_PPSMC_SetHardMinGfxClk, lo) && pmSend(PHX_PPSMC_SetSoftMaxGfxClk, hi);
+    if (ok) {
+        gPm.hardMin = lo;
+        gPm.softMax = hi;
+    }
+    return ok;
+}
+
+void PhxBringup::pmPolicy(const phx_smu13_0_4_metrics &m) {
+    const int mode = gPmMode;
+    // clocks only once the GFX block is powered and driven, and only inside the PMFW's own range
+    if (!gpuReady() || !gPm.dpmMax)
+        return;
+    if (mode != 1 && mode != 2) {
+        if (pmModeApplied && pmSetRange(gPm.dpmMin, gPm.dpmMax))
+            pmModeApplied = 0;
+        pmCap = 0;
+        return;
+    }
+    const phxpm::Range r = phxpm::clampRange(0, gPmGfxMax, gPm.dpmMin, gPm.dpmMax);
+    const int lo = r.lo, hi = r.hi;
+    if (mode == 1) {
+        // as Linux AUTO: set the range, re-assert it every ~10 s in case a GFX power-up reset it
+        const uint32_t every = static_cast<uint32_t>(10000 / (gPmMs > 50 ? gPmMs : 50));
+        if (pmModeApplied != 1 || gPm.hardMin != lo || gPm.softMax != hi || (every && pmTicks % every == 0))
+            if (pmSetRange(lo, hi))
+                pmModeApplied = 1;
+        pmCap = 0;
+        return;
+    }
+    // mode 2: an ondemand governor on the SoftMax (phx_smu_pm.h)
+    const int want = phxpm::governorStep(pmCap, m.GfxActivity / 100, r, gPmUp, gPmTarget, gPmStepDown);
+    if (pmModeApplied != 2 || gPm.hardMin != lo) {
+        if (pmSetRange(lo, want)) {
+            pmModeApplied = 2;
+            pmCap = want;
+        }
+    } else if (want != gPm.softMax) {
+        if (pmSend(PHX_PPSMC_SetSoftMaxGfxClk, static_cast<uint32_t>(want))) {   // floor unchanged: one message
+            gPm.softMax = want;
+            pmCap = want;
+        }
+    }
+}
+
+// ---- GFXOFF ----------------------------------------------------------------------------------------------------
+// Linux amdgpu_gfx_off_ctrl: a request count; the first request sends DisallowGfxOff (the PMFW answers once GFX is up),
+// the last release lets AllowGfxOff go out after a delay (gfx_off_delay_work, 100 ms) so a burst of accesses does not
+// toggle the power island each time.
+void PhxBringup::gfxAwake() const {
+    if (!gfxLock)
+        return;
+    IOLockLock(gfxLock);
+    gfxRef++;
+    if (gfxOffAllowed) {
+        uint32_t resp = 0, after = 0;
+        const_cast<PhxBringup *>(this)->smuMessage(PHX_PPSMC_DisallowGfxOff, 0, &resp, &after);
+        if (resp != PHX_PPSMC_Result_OK)
+            gPm.errors++;
+        gfxOffAllowed = false;
+        gPm.gfxWakes++;
+        gPm.gfxoffState = 2;
+    }
+    IOLockUnlock(gfxLock);
+}
+
+void PhxBringup::gfxRelease() const {
+    if (!gfxLock)
+        return;
+    IOLockLock(gfxLock);
+    if (gfxRef > 0)
+        gfxRef--;
+    gfxLastUse = mach_absolute_time();
+    IOLockUnlock(gfxLock);
+}
+
+// From the PM tick: turn RLC power gating on/off as debug.phx_pm_gfxoff asks, and re-allow GFXOFF once no GC access
+// has happened for debug.phx_pm_gfxoff_delay_ms.
+void PhxBringup::gfxoffPolicy() {
+    if (!gfxLock || !mmio)
+        return;
+    const bool want = gPmGfxoff == 1 && gpuReady() && pmReady;
+    if (want && !gfxPgOn) {
+        // gfx_v11_cntl_pg(adev, true): GFX is up here (GFXOFF has not been allowed yet)
+        rlcSafeMode(true);
+        uint32_t pg = rreg(kRegRlcPgCntl);
+        pg = (pg | kRlcPgGfxPowerGating) & ~kRlcPgSmuHandshakeDisable;
+        wreg(kRegRlcPgCntl, pg);
+        wreg(kRegRlcPgDelay3, kRlcPgDelay3Gc1101);
+        rlcSafeMode(false);
+        gfxPgOn = true;
+        IOLog("PhxBringup: gfxoff: RLC power gating on (RLC_PG_CNTL 0x%x)\n", pg);
+    } else if (!want && gfxPgOn) {
+        // gfx_v11_0_set_powergating_state(UNGATE): DisallowGfxOff first, then RLC power gating off
+        IOLockLock(gfxLock);
+        if (gfxOffAllowed) {
+            uint32_t resp = 0, after = 0;
+            smuMessage(PHX_PPSMC_DisallowGfxOff, 0, &resp, &after);
+            gfxOffAllowed = false;
+            gPm.gfxWakes++;
+        }
+        IOLockUnlock(gfxLock);
+        rlcSafeMode(true);
+        wreg(kRegRlcPgCntl, rreg(kRegRlcPgCntl) & ~kRlcPgGfxPowerGating);
+        rlcSafeMode(false);
+        gfxPgOn = false;
+        gPm.gfxoffState = 0;
+        IOLog("PhxBringup: gfxoff: off\n");
+        return;
+    }
+    if (!gfxPgOn)
+        return;
+    IOLockLock(gfxLock);
+    if (!gfxOffAllowed && gfxRef == 0) {
+        uint64_t delay, now = mach_absolute_time();
+        nanoseconds_to_absolutetime(static_cast<uint64_t>(gPmGfxoffDelayMs > 0 ? gPmGfxoffDelayMs : 0) * 1000000ull, &delay);
+        if (now - gfxLastUse >= delay) {
+            uint32_t resp = 0, after = 0;
+            if (smuMessage(PHX_PPSMC_AllowGfxOff, 0, &resp, &after) == kIOReturnSuccess && resp == PHX_PPSMC_Result_OK) {
+                gfxOffAllowed = true;
+                gPm.gfxAllows++;
+                gPm.gfxoffState = 1;
+            } else {
+                gPm.errors++;
+            }
+        }
+    }
+    IOLockUnlock(gfxLock);
+}
+
+void PhxBringup::pmStep() {
+    if (pmResync) {
+        pmResync = false;
+        pmReady = false;
+        pmModeApplied = 0;
+        pmCap = 0;
+        gPm.hardMin = gPm.softMax = 0;
+    }
+    if (pmDead || (!pmReady && !pmSetup()))
+        return;
+    phx_smu13_0_4_metrics m;
+    if (pmTransfer(PHX_SMU_TABLE_SMU_METRICS, &m, sizeof(m)) != kIOReturnSuccess) {
+        // a busy PMFW answers 0xFC now and then; ten misses in a row: send the table address again, five such
+        // resets: give up rather than keep the mailbox busy
+        if (++pmFails >= 10) {
+            pmReady = false;
+            if (++pmResets >= 5) {
+                IOLog("PhxBringup: pm: metrics table keeps failing, telemetry off\n");
+                gPm.state = -4;
+                pmDead = true;
+            }
+        }
+        return;
+    }
+    pmFails = 0;
+    pmTicks++;
+    gPm.updates++;
+    gPm.gfxclk = m.GfxclkFrequency;
+    gPm.gfxclkAvg = m.AverageGfxclkFrequency;
+    gPm.busy = m.GfxActivity / 100;
+    gPm.busyAvg = m.AverageGfxActivity / 100;
+    gPm.fclkAvg = m.AverageFclkFrequency;
+    gPm.socclk = m.SocclkFrequency;
+    gPm.memclk = m.MemclkFrequency;
+    gPm.socketMw = m.CurrentSocketPower;
+    gPm.socketMwAvg = m.AverageSocketPower;
+    gPm.coreMwAvg = m.AverageCorePower;
+    gPm.apuMw = static_cast<int>(m.ApuPower);
+    gPm.vddMw = m.Power[0];
+    gPm.socMw = m.Power[1];
+    gPm.gfxTemp = m.GfxTemperature;
+    gPm.socTemp = m.SocTemperature;
+    gPm.throttler = m.ThrottlerStatus;
+    uint32_t c0 = 0;
+    for (uint16_t r : m.AverageCoreC0Residency)
+        c0 += r;
+    gPm.c0 = static_cast<int>(c0 / 8);
+    pmPolicy(m);
+    gfxoffPolicy();
+}
+
+void PhxBringup::pmTick(thread_call_param_t self, thread_call_param_t) {
+    PhxBringup *me = static_cast<PhxBringup *>(self);
+    int ms = gPmMs;
+    if (ms > 0 && !me->isSleeping)
+        me->pmStep();
+    if (me->pmStop || me->pmDead)
+        return;
+    if (ms <= 0)
+        ms = 1000;          // off: look again in a second
+    else if (ms < 50)
+        ms = 50;
+    uint64_t d;
+    clock_interval_to_deadline(static_cast<uint32_t>(ms), kMillisecondScale, &d);
+    thread_call_enter_delayed(me->pmCall, d);
+}
+
 bool PhxBringup::claimSession() { return OSCompareAndSwap(0, 1, &sessionOpen); }
 
 void PhxBringup::releaseSession() { OSCompareAndSwap(1, 0, &sessionOpen); }
@@ -1342,9 +1798,15 @@ IOReturn PhxBringup::readRegs(uint32_t first, uint32_t count, uint32_t *out) {
     uint64_t len = mmio->getLength();
     if ((static_cast<uint64_t>(first) + count) * 4 > len)
         return kIOReturnBadArgument;
+    // a read inside GC while GFX is powered down returns nothing useful: wake it for the read
+    const bool gc = first < kGcRegEnd && first + count > kGcRegFirst;
+    if (gc)
+        gfxAwake();
     volatile uint32_t *r = reinterpret_cast<volatile uint32_t *>(mmio->getVirtualAddress());
     for (uint32_t i = 0; i < count; i++)
         out[i] = r[first + i];
+    if (gc)
+        gfxRelease();
     return kIOReturnSuccess;
 }
 
@@ -1356,6 +1818,8 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phx_hang_ms);
         sysctl_register_oid(&sysctl__debug_phx_hang_kills);
+        for (struct sysctl_oid *o : kPmOids)
+            sysctl_register_oid(o);
     }
     if (type != PHXN_UC_TYPE)
         return kIOReturnBadArgument;
