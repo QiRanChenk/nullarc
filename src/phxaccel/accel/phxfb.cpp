@@ -326,13 +326,16 @@ public:
     unsigned head() const { return fHead; }
     const PhxFB1Config &config() const { return fCfg; }
     uint32_t connPower() const { return fConnPower; }
-    // What the HDMI port's hardware says, read straight from the display block (no GPU wake): bit 0 = a monitor holds
-    // the hot-plug line (HPD2), bit 1 = the port's encoder back end is enabled (DIG1), bit 2 = the DAL build of the
-    // DMUB firmware runs (the firmware's own, GOP, build cannot light the port), bit 3 = OTG1 runs.
+    // What the external ports' hardware says, read straight from the display block (no GPU wake):
+    //   bit 0  a monitor holds the HDMI port's hot-plug line (HPD at 0x53dc)     bit 1  the HDMI encoder back end is on (DIG1)
+    //   bit 2  the DAL build of the DMUB firmware runs (the firmware's own, GOP, build lights neither port)
+    //   bit 3  OTG1 runs
+    //   bit 4  a DisplayPort sink on the USB-C port (DP alt mode; HPD at 0x53e4)  bit 5  its encoder back end is on (DIG2)
     int hwState() const {
         if (!fMmio) return -1;
         volatile uint32_t *r = (volatile uint32_t *)fMmio->getVirtualAddress();
-        return (int)(((r[0x53dc] >> 4) & 1) | (r[0x5672] & 1) << 1 | (r[0x36a3] == 3 ? 4u : 0u) | (r[0x5081] & 1) << 3);
+        return (int)(((r[0x53dc] >> 4) & 1) | (r[0x5672] & 1) << 1 | (r[0x36a3] == 3 ? 4u : 0u) | (r[0x5081] & 1) << 3 |
+                     ((r[0x53e4] >> 4) & 1) << 4 | (r[0x5772] & 1) << 5);
     }
     // debug.phxfb1_config: the mode and EDID of the monitor the tool has lit on the HDMI port, or "nothing connected"
     IOReturn applyConfig(const PhxFB1Config &c) {
@@ -856,7 +859,7 @@ bool PhxAMDFB::startSecond(IOService *provider)
     }
     if (!fSurfMap) { PFBLOG("head 1: its VRAM at 0x%llx would not map", (unsigned long long)fBase); return false; }
     fMmio = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5);
-    if (fMmio && fMmio->getLength() < 0x5700u * 4) OSSafeReleaseNULL(fMmio);
+    if (fMmio && fMmio->getLength() < 0x5800u * 4) OSSafeReleaseNULL(fMmio);
     uint32_t v = 0;
     PE_parse_boot_argn("phxfb2", &v, sizeof v);
     // 1 = on the panel's IOFBController, as the heads of one GPU are; 2 = a controller of its own. The index is the
@@ -1047,7 +1050,7 @@ static int sysctl_fb1hw SYSCTL_HANDLER_ARGS {
     return sysctl_handle_int(oidp, &v, 0, req);
 }
 SYSCTL_PROC(_debug, OID_AUTO, phxfb1_hw, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_fb1hw, "I",
-            "head 1: bit 0 monitor on the HDMI port (HPD), bit 1 encoder enabled, bit 2 DAL DMUB firmware running, bit 3 OTG1 running");
+            "head 1: bit 0 monitor on the HDMI port (HPD), bit 1 its encoder on, bit 2 DAL DMUB firmware running, bit 3 OTG1 running, bit 4 DP sink on the USB-C port, bit 5 its encoder on");
 static struct sysctl_oid *const kFb1Oids[] = { &sysctl__debug_phxfb1_config, &sysctl__debug_phxfb1_power, &sysctl__debug_phxfb1_hw };
 static bool gFb1Sysctl;
 static void phxFb1Install() { if (!gFb1Sysctl) { for (auto *o : kFb1Oids) sysctl_register_oid(o); gFb1Sysctl = true; } }
