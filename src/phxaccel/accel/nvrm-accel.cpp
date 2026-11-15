@@ -391,7 +391,9 @@ public:
         if (!fDM) return;
         if (fRegLock) IOLockLock(fRegLock);
         uint8_t *dm = (uint8_t *)fDM;
-        for (int i = 0; i < 4 && *(const volatile uint32_t *)(dm + 0x10c) > 0; i++) {
+        // Each framebuffer leaves its own changes open across the sleep (four with the panel and one external head,
+        // nine with three heads, 2026-11-15): close every one; the bound only guards against a count that never drops.
+        for (int i = 0; i < 64 && *(const volatile uint32_t *)(dm + 0x10c) > 0; i++) {
             ALOG("  resume: closing an open mode change (nest %u)", *(const volatile uint32_t *)(dm + 0x10c));
             fDM->display_mode_did_change(0);
         }

@@ -34,7 +34,7 @@ struct PhxAGDCGPUCapability {
 static_assert(sizeof(PhxAGDCVendorInfo) == 0x2c, "AGDCVendorInfo_t is 0x2c");
 static_assert(sizeof(PhxAGDCGPUCapability) == 0xdc, "AGDCGPUCapability_t is 0xdc");
 
-static IOService *gPci = nullptr, *gFB[2] = {};   // held while the service is up; by IOFBDependentIndex (0 = the panel)
+static IOService *gPci = nullptr, *gFB[3] = {};   // held while the service is up; by IOFBDependentIndex (0 = the panel)
 static SInt64 gCmds = 0, gRefused = 0, gFbReplies = 0, gK5 = 0;
 static int gLastRefused = 0, gLogged = 0;
 
@@ -89,10 +89,10 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
         if (!out || !outSize || *outSize != sizeof(PhxAGDCGPUCapability)) return kIOReturnBadArgument;
         PhxAGDCGPUCapability *c = (PhxAGDCGPUCapability *)out;
         bzero(c, sizeof *c);
-        const unsigned n = gFB[1] ? 2 : 1;
-        c->portMask = n == 2 ? (1ull << 1 | 1ull << 2) : 1ull << 1;   // a head's link answers as port 1 + its index
+        const unsigned n = gFB[2] ? 3 : gFB[1] ? 2 : 1;
+        c->portMask = ((1ull << n) - 1) << 1;   // a head's link answers as port 1 + its index
         c->countA = c->countB = c->countC = c->countD = 1;
-        c->maxFramebuffers = n; c->pciDevice = gPci; c->framebuffer[0] = gFB[0]; c->framebuffer[1] = gFB[1];
+        c->maxFramebuffers = n; c->pciDevice = gPci; c->framebuffer[0] = gFB[0]; c->framebuffer[1] = gFB[1]; c->framebuffer[2] = gFB[2];
         if (OSAddAtomic64(1, &gFbReplies) < 4) AGLOG("0x980: %u framebuffer(s) (PhxFB id %#llx)", n, gFB[0] ? gFB[0]->getRegistryEntryID() : 0ull);
         return kIOReturnSuccess;
     }
@@ -101,12 +101,12 @@ IOReturn PhxDeviceControl::vendor_doDeviceAttribute(unsigned int cmd, unsigned l
     // in software. The firmware lit the panel without telling its timing, so the answer carries the CVT reduced-blanking
     // timing of the mode (NullMoth's K5 replies, nvrm-agdc-k5.h).
     if (cmd == NVK5_CMD_LINKCONFIG || cmd == NVK5_CMD_FBCAPEX) {
-        uint32_t t[2][NVK5_TIMING_WORDS];
-        panelTiming(t[0], 0);
-        if (gFB[1]) panelTiming(t[1], 1);
-        const struct nvk5_head hs[2] = { { t[0], sizeof t[0] }, { t[1], sizeof t[1] } };
+        uint32_t t[3][NVK5_TIMING_WORDS];
+        const unsigned nfb = gFB[2] ? 3 : gFB[1] ? 2 : 1;
+        for (unsigned i = 0; i < nfb; i++) panelTiming(t[i], i);
+        const struct nvk5_head hs[3] = { { t[0], sizeof t[0] }, { t[1], sizeof t[1] }, { t[2], sizeof t[2] } };
         int why = 0; int32_t which = -1;
-        const int r = nvk5_answer_heads(cmd, in, inSize, out, outSize ? *outSize : 0, hs, gFB[1] ? 2 : 1, &why, &which);
+        const int r = nvk5_answer_heads(cmd, in, inSize, out, outSize ? *outSize : 0, hs, nfb, &why, &which);
         if (r == NVK5_R_LINK || r == NVK5_R_CAPS) {
             if (OSAddAtomic64(1, &gK5) < 8) AGLOG("command %#x answered (%s)", cmd, r == NVK5_R_LINK ? "link config" : "plane scaler");
             return kIOReturnSuccess;
@@ -125,7 +125,7 @@ static int gState = 0, gWant = 0;
 static thread_call_t gCall = nullptr;
 static SInt32 gBusy = 0;
 
-static void dropTargets() { OSSafeReleaseNULL(gFB[0]); OSSafeReleaseNULL(gFB[1]); gPci = nullptr; }
+static void dropTargets() { for (IOService *&f : gFB) OSSafeReleaseNULL(f); gPci = nullptr; }
 
 static void agdcWork(thread_call_param_t, thread_call_param_t)
 {
@@ -141,24 +141,24 @@ static void agdcWork(thread_call_param_t, thread_call_param_t)
         OSDictionary *m = IOService::serviceMatching("PhxAMDFB");
         OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr;
         OSSafeReleaseNULL(m);
-        IOService *fbs[2] = {};
+        IOService *fbs[3] = {};
         while (OSObject *o = it ? it->getNextObject() : nullptr) {   // the panel and, with phxfb2, the HDMI head
             IOService *f = OSDynamicCast(IOService, o);
             OSNumber *n = f ? OSDynamicCast(OSNumber, f->getProperty("IOFBDependentIndex")) : nullptr;
             const unsigned i = n ? n->unsigned32BitValue() : 0;
-            if (f && i < 2 && !fbs[i]) { f->retain(); fbs[i] = f; }
+            if (f && i < 3 && !fbs[i]) { f->retain(); fbs[i] = f; }
         }
         OSSafeReleaseNULL(it);
         IOService *fb = fbs[0];
         IOService *p = fb ? fb->getProvider() : nullptr;
-        if (!fb || !OSDynamicCast(IOPCIDevice, p)) { gState = -1; AGLOG("no PhxFB on a PCI device yet"); OSSafeReleaseNULL(fbs[0]); OSSafeReleaseNULL(fbs[1]); break; }
-        gFB[0] = fbs[0]; gFB[1] = fbs[1]; gPci = p;
+        if (!fb || !OSDynamicCast(IOPCIDevice, p)) { gState = -1; AGLOG("no PhxFB on a PCI device yet"); for (IOService *&f : fbs) OSSafeReleaseNULL(f); break; }
+        gFB[0] = fbs[0]; gFB[1] = fbs[1]; gFB[2] = fbs[2]; gPci = p;
         PhxDeviceControl *d = OSTypeAlloc(PhxDeviceControl);
         if (!d || !d->init(nullptr)) { gState = -3; AGLOG("alloc/init failed"); OSSafeReleaseNULL(d); dropTargets(); break; }
         if (!d->attach(p)) { gState = -4; AGLOG("attach(%s) failed", p->getName()); d->release(); dropTargets(); break; }
         if (!d->start(p)) { gState = -5; AGLOG("AppleGraphicsDeviceControl::start failed"); d->detach(p); d->release(); dropTargets(); break; }
         gAgdc = d; gState = 1;
-        AGLOG("UP on %s: %u framebuffer slot(s) (PhxFB); vendor calls so far %lld", p->getName(), gFB[1] ? 2u : 1u, gCmds);
+        AGLOG("UP on %s: %u framebuffer slot(s) (PhxFB); vendor calls so far %lld", p->getName(), gFB[2] ? 3u : gFB[1] ? 2u : 1u, gCmds);
     } while (0);
     else if (gWant == 0 && gAgdc) {
         PhxDeviceControl *d = gAgdc; gAgdc = nullptr;

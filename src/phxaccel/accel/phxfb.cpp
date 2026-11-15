@@ -41,7 +41,8 @@ SYSCTL_INT(_debug, OID_AUTO, phxfb_alias, CTLFLAG_RW | CTLFLAG_LOCKED, &gAlias, 
 // measurements, and nvrm-accel.cpp times its presents against the last tick (gPhxVblLastAbs, gPhxFrameAbs).
 static int gVblStaged = 1;
 static SInt64 gVblN, gVblLateUsSum, gVblLateUsMax;
-// Per head (IOFBDependentIndex; the accelerator has room for five): the panel is head 0, the HDMI port head 1.
+// Per head (IOFBDependentIndex; the accelerator has room for five): the panel is head 0, the HDMI port head 1, the
+// USB-C port (DisplayPort) head 2 when phxfb3=1 asks for it.
 enum { kPhxHeads = 5 };
 uint64_t gPhxVblLastAbs[kPhxHeads], gPhxFrameAbs[kPhxHeads];
 volatile uint64_t gPhxVblSeq[kPhxHeads];   // ticks so far, counted before the handlers run: the display pipe completes on the next one
@@ -63,6 +64,7 @@ enum : uint32_t { kBlCntl = 0x34c0 + 0x2f19, kBlPeriod = 0x34c0 + 0x2f1b, kBlLoc
 static constexpr uint32_t kBlSeqs[] = { 0, 0x2f85 - 0x2f19 };
 static constexpr uint32_t kBlMax = 1024;   // the brightness parameter's range
 class PhxAMDFB;
+static bool gFbSelfHead2();
 static IOService *phxBacklightCreate(PhxAMDFB *fb);
 static PhxAMDFB *gPhxPanel;   // head 0
 static volatile bool gWsAsleep;      // WindowServer has the displays asleep (kIOWindowServerActiveAttribute 4)
@@ -74,7 +76,12 @@ static thread_call_t gPanelCall;     // the panel's return to the desktop, put o
 // reports the connection to IOGraphics (connect interrupt), and WindowServer's frames are copied into the buffer as on
 // the panel. Its scan-out is a fixed part of the GPU's VRAM that nothing else uses on this machine (the panel's frame
 // sits at 0, the firmware and bring-up areas end below 0x5000000).
+// A third head (boot-arg phxfb3=1 beside phxfb2): the same for display pipe 2, so that the HDMI port and the USB-C port
+// can each hold a monitor; its buffer follows head 1's, and it is told through debug.phxfb2_config. Without it the
+// two ports share head 1 (one monitor at a time).
 static constexpr uint64_t kHead1VramOff = 0x6000000, kHead1VramBytes = 64ull << 20;
+enum { kPhxExtHeads = 2 };          // heads 1 and 2
+static constexpr uint64_t headVramOff(unsigned head) { return kHead1VramOff + (head - 1) * kHead1VramBytes; }
 struct PhxFB1Config {
     uint32_t version;          // 1
     uint32_t online;           // 1 = a monitor is lit with the mode below, 0 = nothing connected
@@ -103,8 +110,9 @@ class PhxAMDFB : public IOFramebuffer {
     volatile UInt32 fAliasBusy = 0;
     struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
     Irq fVbl[4], fConnect;   // IOFramebuffer itself and, when it asks, IOAccelDisplayPipe each register a VBL handler
-    unsigned fHead = 0;                // 0 = the panel, 1 = the HDMI port
-    PhxAMDFB *fSecond = nullptr;       // head 0 keeps the head it created
+    unsigned fHead = 0;                // 0 = the panel, 1 = the HDMI port, 2 = the USB-C port (phxfb3)
+    PhxAMDFB *fExt[kPhxExtHeads] = {}; // head 0 keeps the heads it created
+    bool extOnline() const { for (PhxAMDFB *e : fExt) if (e && e->fOnline) return true; return false; }
     volatile bool fOnline = true, fVblRun = false;
     IODisplayModeID fModeID = 1;       // a new one for every mode head 1 is given
     PhxFB1Config fCfg = {};
@@ -290,7 +298,7 @@ class PhxAMDFB : public IOFramebuffer {
         setProperty("PhxFBRefreshMilliHz", fRefreshMilliHz, 32);
         if (fHTotal) { setProperty("PhxFBHTotal", fHTotal, 32); setProperty("PhxFBVTotal", fVTotal, 32); }
         if (fHead) {
-            setProperty("PhxFBVramOffset", kHead1VramOff, 64); setProperty("PhxFBPitchPixels", fRowBytes / 4, 32);
+            setProperty("PhxFBVramOffset", headVramOff(fHead), 64); setProperty("PhxFBPitchPixels", fRowBytes / 4, 32);
             setProperty("PhxFBOnline", fOnline ? kOSBooleanTrue : kOSBooleanFalse);
         }
     }
@@ -331,11 +339,12 @@ public:
     //   bit 2  the DAL build of the DMUB firmware runs (the firmware's own, GOP, build lights neither port)
     //   bit 3  OTG1 runs
     //   bit 4  a DisplayPort sink on the USB-C port (DP alt mode; HPD at 0x53e4)  bit 5  its encoder back end is on (DIG2)
+    //   bit 6  OTG2 runs       bit 7  there is a head 2 (phxfb3=1): each port has a head of its own
     int hwState() const {
         if (!fMmio) return -1;
         volatile uint32_t *r = (volatile uint32_t *)fMmio->getVirtualAddress();
         return (int)(((r[0x53dc] >> 4) & 1) | (r[0x5672] & 1) << 1 | (r[0x36a3] == 3 ? 4u : 0u) | (r[0x5081] & 1) << 3 |
-                     ((r[0x53e4] >> 4) & 1) << 4 | (r[0x5772] & 1) << 5);
+                     ((r[0x53e4] >> 4) & 1) << 4 | (r[0x5772] & 1) << 5 | (r[0x5101] & 1) << 6 | (gFbSelfHead2() ? 0x80u : 0u));
     }
     // debug.phxfb1_config: the mode and EDID of the monitor the tool has lit on the HDMI port, or "nothing connected"
     IOReturn applyConfig(const PhxFB1Config &c) {
@@ -436,7 +445,7 @@ public:
     // lid ("ClamshellUpdate ... result=0": the slider showed full brightness on a dimmer panel, 2026-11-15).
     void panelOnline() {
         if (fHead || !fBacklight) return;
-        const bool want = !(fLidClosed && fSecond && fSecond->fOnline);
+        const bool want = !(fLidClosed && extOnline());
         if (want == fOnline) return;
         // Coming back while the displays sleep (lid closed after the screens went dark, then opened) left the panel
         // without its desktop picture (2026-11-15): it returns once WindowServer has woken the displays.
@@ -838,7 +847,8 @@ static bool takeBootArming()
     return armed && !stuck;
 }
 
-static PhxAMDFB *gFbSelf[2];
+static PhxAMDFB *gFbSelf[1 + kPhxExtHeads];
+static bool gFbSelfHead2() { return gFbSelf[2] != nullptr; }
 static void phxFb1Install();
 
 // Head 1: created by head 0's start, attached to the same PCI device. It starts with nothing connected.
@@ -851,13 +861,13 @@ bool PhxAMDFB::startSecond(IOService *provider)
         IODeviceMemory *dm = fPCI->getDeviceMemoryWithIndex(i);
         if (dm && fBase >= dm->getPhysicalAddress() && fBase - dm->getPhysicalAddress() + kHead1VramBytes <= dm->getLength()) inBar = true;
     }
-    if (!inBar) { PFBLOG("head 1: VRAM 0x%llx + %llu MB is outside the GPU's BARs", kHead1VramOff, kHead1VramBytes >> 20); return false; }
+    if (!inBar) { PFBLOG("head %u: VRAM 0x%llx + %llu MB is outside the GPU's BARs", fHead, headVramOff(fHead), kHead1VramBytes >> 20); return false; }
     fBeside = true; fOnline = false;
     fWidth = 2560; fHeight = 1440; fRowBytes = 2560 * 4; fRefreshMilliHz = 60000; fFrameNs = kFrameNs;
     if (IODeviceMemory *sm = IODeviceMemory::withRange(fBase, (IOPhysicalLength)kHead1VramBytes)) {
         fSurfMap = sm->map(kIOMapWriteCombineCache); sm->release();
     }
-    if (!fSurfMap) { PFBLOG("head 1: its VRAM at 0x%llx would not map", (unsigned long long)fBase); return false; }
+    if (!fSurfMap) { PFBLOG("head %u: its VRAM at 0x%llx would not map", fHead, (unsigned long long)fBase); return false; }
     fMmio = fPCI->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress5);
     if (fMmio && fMmio->getLength() < 0x5800u * 4) OSSafeReleaseNULL(fMmio);
     uint32_t v = 0;
@@ -865,8 +875,8 @@ bool PhxAMDFB::startSecond(IOService *provider)
     // 1 = on the panel's IOFBController, as the heads of one GPU are; 2 = a controller of its own. The index is the
     // accelerator's head number either way.
     setProperty("IOFBDependentID", 0x50485846ull << 32 | (v == 2 ? 2 : 1), 64);
-    setProperty("IOFBDependentIndex", 1ull, 32);
-    setProperty("PhxFBHead", 1ull, 32);
+    setProperty("IOFBDependentIndex", (uint64_t)fHead, 32);
+    setProperty("PhxFBHead", (uint64_t)fHead, 32);
     if (!IOFramebuffer::start(provider)) { OSSafeReleaseNULL(fSurfMap); return false; }
     setProperty("IOFBGammaWidth", 8ull, 32);
     setProperty("IOFBGammaCount", 256ull, 32);
@@ -880,9 +890,9 @@ bool PhxAMDFB::startSecond(IOService *provider)
         { 1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
     };
     registerPowerDriver(this, states, 2);
-    gFbSelf[1] = this;
+    gFbSelf[fHead] = this;
     phxFb1Install();
-    PFBLOG("head 1 published, offline: VRAM offset 0x%llx (physical 0x%llx), %llu MB", kHead1VramOff, (unsigned long long)fBase,
+    PFBLOG("head %u published, offline: VRAM offset 0x%llx (physical 0x%llx), %llu MB", fHead, headVramOff(fHead), (unsigned long long)fBase,
            kHead1VramBytes >> 20);
     return true;
 }
@@ -988,16 +998,17 @@ bool PhxAMDFB::start(IOService *provider)
     if (!gAliasSysctl) { for (auto *o : kFbOids) sysctl_register_oid(o); gAliasSysctl = true; }
     PFBLOG("panel published: %ux%u row %u at 0x%llx (vbl timer %s)", fWidth, fHeight, fRowBytes,
            (unsigned long long)fBase, fVblTimer ? "running" : "MISSING");
-    uint32_t two = 0;
-    if (PE_parse_boot_argn("phxfb2", &two, sizeof two) && two) {
+    uint32_t two = 0, three = 0;
+    PE_parse_boot_argn("phxfb2", &two, sizeof two); PE_parse_boot_argn("phxfb3", &three, sizeof three);
+    for (unsigned h = 1; h <= kPhxExtHeads && two && (h == 1 || three); h++) {
         PhxAMDFB *s = OSTypeAlloc(PhxAMDFB);
         if (s && s->init(nullptr)) {
-            s->setHead(1, fBase + kHead1VramOff);
+            s->setHead(h, fBase + headVramOff(h));
             if (!s->attach(provider)) OSSafeReleaseNULL(s);
             else if (!s->start(provider)) { s->detach(provider); OSSafeReleaseNULL(s); }
         } else OSSafeReleaseNULL(s);
-        fSecond = s;
-        if (!s) PFBLOG("head 1 would not start: the panel alone");
+        fExt[h - 1] = s;
+        if (!s) { PFBLOG("head %u would not start", h); break; }
     }
     return true;
 }
@@ -1025,8 +1036,9 @@ SYSCTL_PROC(_debug, OID_AUTO, phxfb_lid, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCK
 
 void phxFbWakeInstall(void *fb) { if (!gFbSelf[0]) { gFbSelf[0] = static_cast<PhxAMDFB *>(fb); sysctl_register_oid(&sysctl__debug_phxfb_wake); sysctl_register_oid(&sysctl__debug_phxfb_lid); } }
 
-static int sysctl_fb1config SYSCTL_HANDLER_ARGS {
-    PhxAMDFB *fb = gFbSelf[1];
+// debug.phxfb1_* for head 1 and debug.phxfb2_* for head 2: arg2 is the head
+static int sysctl_fbNconfig SYSCTL_HANDLER_ARGS {
+    PhxAMDFB *fb = gFbSelf[arg2];
     if (!fb) return ENXIO;
     if (!req->newptr) { PhxFB1Config c = fb->config(); c.version = 1; return SYSCTL_OUT(req, &c, sizeof c); }
     if (req->newlen != sizeof(PhxFB1Config)) return EINVAL;
@@ -1037,32 +1049,41 @@ static int sysctl_fb1config SYSCTL_HANDLER_ARGS {
     IOFree(c, sizeof(PhxFB1Config));
     return err;
 }
-SYSCTL_PROC(_debug, OID_AUTO, phxfb1_config, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_fb1config, "S,PhxFB1Config",
+SYSCTL_PROC(_debug, OID_AUTO, phxfb1_config, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 1, sysctl_fbNconfig, "S,PhxFB1Config",
             "head 1 (HDMI): the mode and EDID of the monitor user space has lit, or offline");
-static int sysctl_fb1power SYSCTL_HANDLER_ARGS {
-    int v = gFbSelf[1] ? (int)gFbSelf[1]->connPower() : -1;
+SYSCTL_PROC(_debug, OID_AUTO, phxfb2_config, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 2, sysctl_fbNconfig, "S,PhxFB1Config",
+            "head 2 (USB-C DisplayPort, phxfb3=1): the mode and EDID of the monitor user space has lit, or offline");
+static int sysctl_fbNpower SYSCTL_HANDLER_ARGS {
+    int v = gFbSelf[arg2] ? (int)gFbSelf[arg2]->connPower() : -1;
     return sysctl_handle_int(oidp, &v, 0, req);
 }
-SYSCTL_PROC(_debug, OID_AUTO, phxfb1_power, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_fb1power, "I",
+SYSCTL_PROC(_debug, OID_AUTO, phxfb1_power, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 1, sysctl_fbNpower, "I",
             "head 1: the connection power WindowServer last asked for (0 = display sleep)");
+SYSCTL_PROC(_debug, OID_AUTO, phxfb2_power, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 2, sysctl_fbNpower, "I",
+            "head 2: the connection power WindowServer last asked for (0 = display sleep)");
 static int sysctl_fb1hw SYSCTL_HANDLER_ARGS {
     int v = gFbSelf[1] ? gFbSelf[1]->hwState() : -1;
     return sysctl_handle_int(oidp, &v, 0, req);
 }
 SYSCTL_PROC(_debug, OID_AUTO, phxfb1_hw, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_fb1hw, "I",
-            "head 1: bit 0 monitor on the HDMI port (HPD), bit 1 its encoder on, bit 2 DAL DMUB firmware running, bit 3 OTG1 running, bit 4 DP sink on the USB-C port, bit 5 its encoder on");
+            "the external ports: bit 0 monitor on the HDMI port (HPD), bit 1 its encoder on, bit 2 DAL DMUB firmware running, bit 3 OTG1 running, bit 4 DP sink on the USB-C port, bit 5 its encoder on, bit 6 OTG2 running, bit 7 head 2 exists");
 static struct sysctl_oid *const kFb1Oids[] = { &sysctl__debug_phxfb1_config, &sysctl__debug_phxfb1_power, &sysctl__debug_phxfb1_hw };
-static bool gFb1Sysctl;
-static void phxFb1Install() { if (!gFb1Sysctl) { for (auto *o : kFb1Oids) sysctl_register_oid(o); gFb1Sysctl = true; } }
+static struct sysctl_oid *const kFb2Oids[] = { &sysctl__debug_phxfb2_config, &sysctl__debug_phxfb2_power };
+static bool gFb1Sysctl, gFb2Sysctl;
+static void phxFb1Install() {
+    if (!gFb1Sysctl && gFbSelf[1]) { for (auto *o : kFb1Oids) sysctl_register_oid(o); gFb1Sysctl = true; }
+    if (!gFb2Sysctl && gFbSelf[2]) { for (auto *o : kFb2Oids) sysctl_register_oid(o); gFb2Sysctl = true; }
+}
 
 void PhxAMDFB::stop(IOService *provider)
 {
     fStopping = true;
     if (gPhxPanel == this) gPhxPanel = nullptr;
-    if (fSecond) { fSecond->terminate(kIOServiceRequired | kIOServiceSynchronous); OSSafeReleaseNULL(fSecond); }
+    for (PhxAMDFB *&e : fExt) if (e) { e->terminate(kIOServiceRequired | kIOServiceSynchronous); OSSafeReleaseNULL(e); }
     if (fHead) {
-        if (gFbSelf[1] == this) gFbSelf[1] = nullptr;
-        if (gFb1Sysctl) { for (auto *o : kFb1Oids) sysctl_unregister_oid(o); gFb1Sysctl = false; }
+        if (gFbSelf[fHead] == this) gFbSelf[fHead] = nullptr;
+        if (fHead == 1 && gFb1Sysctl) { for (auto *o : kFb1Oids) sysctl_unregister_oid(o); gFb1Sysctl = false; }
+        if (fHead == 2 && gFb2Sysctl) { for (auto *o : kFb2Oids) sysctl_unregister_oid(o); gFb2Sysctl = false; }
     } else {
         if (gFbSelf[0] == this) { gFbSelf[0] = nullptr; sysctl_unregister_oid(&sysctl__debug_phxfb_wake); sysctl_unregister_oid(&sysctl__debug_phxfb_lid); }
         phxAgdcRemove();
