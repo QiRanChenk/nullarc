@@ -404,9 +404,32 @@ public:
     // powered down goes dark and gets its level back on power-up; a brightness set while dark waits.
     bool fBlDark = false;
     uint32_t fBlSaved = kBlMax;
+    // The lid beside an external monitor (clamshell, the Mac stays awake): CoreBrightness sets the panel's level to 0
+    // when the lid closes and does not bring it back when it opens; the panel stayed dark until the brightness keys
+    // were used (2026-11-15). The last level above 0 comes back when the lid opens, and a 0 that arrives in the
+    // seconds after that is dropped.
+    uint32_t fBlLastOn = 0, fLidEvents = 0;
+    bool fLidClosed = false;
+    uint64_t fLidGraceEnd = 0;
     bool backlightSet(uint32_t level) {
-        if (fBlDark) { if (level) fBlSaved = level > kBlMax ? kBlMax : level; return true; }
+        if (level) fBlLastOn = level > kBlMax ? kBlMax : level;
+        if (fBlDark) { if (level) fBlSaved = fBlLastOn; return true; }
+        if (!level && !fLidClosed && mach_absolute_time() < fLidGraceEnd) return true;
         return backlightWrite(level);
+    }
+    void lidChanged(bool closed) {
+        fLidClosed = closed;
+        setProperty("PhxLid", ++fLidEvents << 1 | (closed ? 1u : 0u), 32);
+        if (closed || !fBacklight) return;
+        uint64_t grace; nanoseconds_to_absolutetime(5000000000ull, &grace);
+        fLidGraceEnd = mach_absolute_time() + grace;
+        uint32_t now = 0;
+        if (fBlDark) { if (!fBlSaved) fBlSaved = fBlLastOn; }
+        else if (backlightRead(&now) && !now && fBlLastOn) { backlightWrite(fBlLastOn); PFBLOG("backlight: lid opened, level %u again", fBlLastOn); }
+    }
+    static IOReturn fbEvent(OSObject *self, void *, IOFramebuffer *, IOIndex event, void *info) {
+        if (event == kIOFBNotifyClamshellChange) static_cast<PhxAMDFB *>(self)->lidChanged(info == kOSBooleanTrue);
+        return kIOReturnSuccess;
     }
     void displayPower(bool on) {
         if (!fBacklight || on != fBlDark) return;
@@ -888,7 +911,7 @@ bool PhxAMDFB::start(IOService *provider)
     if (PE_parse_boot_argn("-phxbloff", arg, sizeof arg)) PFBLOG("backlight: -phxbloff, no brightness control");
     else if (!backlightRead(&bl)) PFBLOG("backlight: the PWM is not running (no MMIO view, or off), no brightness control");
     else if (!(fBacklight = phxBacklightCreate(this))) PFBLOG("backlight: the handler would not attach");
-    else PFBLOG("backlight: PWM at %u of %u", bl, kBlMax);
+    else { PFBLOG("backlight: PWM at %u of %u", bl, kBlMax); fBlLastOn = bl; }
     if (!IOFramebuffer::start(provider)) {
         if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
         OSSafeReleaseNULL(fMmio); OSSafeReleaseNULL(fSurfMap); return false; }
@@ -910,6 +933,7 @@ bool PhxAMDFB::start(IOService *provider)
     };
     registerPowerDriver(this, states, 2);
     { extern void phxFbWakeInstall(void *); phxFbWakeInstall(this); }
+    addFramebufferNotification(&PhxAMDFB::fbEvent, this, nullptr);
     phxHoldInit(this, kBootHoldSec);
     phxAgdcInstall();
     if (!gAliasSysctl) { for (auto *o : kFbOids) sysctl_register_oid(o); gAliasSysctl = true; }
