@@ -59,7 +59,7 @@ enum {
                                       out: [0] resp.status [1] fence us [2] resp dword@+8 [3] resp dword@+12
                                       For experimenting with SETUP_TMR / LOAD_TOC params. Addresses are built in
                                       userspace from phx-fb-mc-base and phx-fb-phys. */
-    PHXN_SEL_DBG_WRITE_REG = 108,  /* in: [0] absolute dword register [1] value; writes MMIO. out[0] = readback.
+    PHXN_SEL_DBG_WRITE_REG = 108,  /* in: [0] absolute dword register [1] value [2] optional, 1 = no read-back (index/data registers); writes MMIO. out[0] = readback.
                                       Ring/engine bring-up experimentation (root + phxdebug). */
     PHXN_SEL_DBG_VRAM_WRITE = 109, /* in: [0] VRAM byte offset (dword-aligned) [1] dword value; writes via BAR0. */
     PHXN_SEL_DBG_ADOPTQ = 112,     /* in: [0] ring VRAM off [1] ring dwords [2] wb VRAM off (wptr shadow at +16) [3] doorbell byte off [4] wptr [5] fence VRAM off | queue (0 compute, 1 gfx) */

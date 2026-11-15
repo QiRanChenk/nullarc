@@ -182,7 +182,7 @@ public:
     void releaseSession();
     IOReturn readRegs(uint32_t first, uint32_t count, uint32_t *out);
     IOReturn vramRead(uint32_t byteOff, uint32_t count, uint32_t *out);
-    IOReturn writeReg(uint32_t reg, uint32_t value, uint32_t *readback);
+    IOReturn writeReg(uint32_t reg, uint32_t value, uint32_t *readback, bool noReadback = false);
     IOReturn vramWrite(uint32_t byteOff, uint32_t value);
     IOReturn doorbellWrite(uint64_t byteOff, uint64_t value);
     IOReturn sysMem(uint64_t op, uint64_t a, uint64_t b, uint64_t *out0, uint64_t *out1);
@@ -678,7 +678,7 @@ IOReturn PhxBringup::vramRead(uint32_t byteOff, uint32_t count, uint32_t *out) {
 }
 
 // Write one MMIO dword (bring-up experimentation; root + phxdebug only). Returns the readback.
-IOReturn PhxBringup::writeReg(uint32_t reg, uint32_t value, uint32_t *readback) {
+IOReturn PhxBringup::writeReg(uint32_t reg, uint32_t value, uint32_t *readback, bool noReadback) {
     if (!mmio)
         return kIOReturnNotReady;
     if ((static_cast<uint64_t>(reg) + 1) * 4 > mmio->getLength())
@@ -686,7 +686,10 @@ IOReturn PhxBringup::writeReg(uint32_t reg, uint32_t value, uint32_t *readback) 
     GfxGuard awake(this);
     wreg(reg, value);
     __asm__ __volatile__("mfence" ::: "memory");
-    *readback = rreg(reg);
+    // The read-back is wrong for registers whose index moves on every access (DCN's VPG_GENERIC_PACKET_DATA, LUT and
+    // coefficient RAM data, DC_I2C_DATA): it shifted the following writes, and an AVI InfoFrame replayed that way came
+    // out scrambled (a monitor that checks it blanked). A third input of 1 skips it.
+    *readback = noReadback ? 0 : rreg(reg);
     return kIOReturnSuccess;
 }
 
@@ -2533,10 +2536,11 @@ IOReturn IOAccelPhxNativeClient::doDbgWriteReg(IOExternalMethodArguments *a) {
         return kIOReturnUnsupported;
     if (!privileged)
         return kIOReturnNotPrivileged;
-    if (!shape(a, 2, 1, 0, 0) || a->scalarInput[0] > 0xFFFFFFFFull || a->scalarInput[1] > 0xFFFFFFFFull)
+    if ((!shape(a, 2, 1, 0, 0) && !shape(a, 3, 1, 0, 0)) || a->scalarInput[0] > 0xFFFFFFFFull || a->scalarInput[1] > 0xFFFFFFFFull)
         return kIOReturnBadArgument;
     uint32_t rb = 0;
-    IOReturn r = owner->writeReg(static_cast<uint32_t>(a->scalarInput[0]), static_cast<uint32_t>(a->scalarInput[1]), &rb);
+    const bool noRead = a->scalarInputCount == 3 && (a->scalarInput[2] & 1);
+    IOReturn r = owner->writeReg(static_cast<uint32_t>(a->scalarInput[0]), static_cast<uint32_t>(a->scalarInput[1]), &rb, noRead);
     a->scalarOutput[0] = rb;
     return r;
 }
