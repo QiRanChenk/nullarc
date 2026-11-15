@@ -1042,8 +1042,8 @@ static int gIopBench;   // debug.nvaccel_iop_bench: 1 = time a read-only pass ov
 static SInt64 gIopReadUs, gIopCopyUs, gIopCopyUsMax, gIopCopyUsSum;
 // The present cadence against the panel's (PhxFB's VBL tick, phxfb.cpp): gaps between copied frames of about one
 // refresh, two, three, or more (idle), and the summed delay from the last tick to each present.
-extern uint64_t gPhxVblLastAbs, gPhxFrameAbs;
-static uint64_t gIopLastAbs;
+extern uint64_t gPhxVblLastAbs[], gPhxFrameAbs[];   // per head (phxfb.cpp, kPhxHeads = kNvMaxFB)
+static uint64_t gIopLastAbs[kNvMaxFB];
 static SInt64 gCntIopGap[4], gIopPhaseUsSum;
 static int gIopSse = 0;   // debug.nvaccel_iop_sse
 
@@ -1107,15 +1107,16 @@ static void nvIopRowSSE(const void *src, void *dst, unsigned long bytes, bool l1
 // next: frames 3-4 ms apart followed by 12-16 ms gaps, 97 presents a second on a 120 Hz panel (2026-10-21). The
 // accelerator re-checks on each VBL interrupt while a transaction is pending; past two refreshes the frame completes
 // regardless (debug.nvaccel_iop_vsync, 0 = complete at once).
-extern volatile uint64_t gPhxVblSeq;
+extern volatile uint64_t gPhxVblSeq[];
 static int gIopVsync = 0;   // phxboot turns it on once the panel is armed
 static SInt64 gCntIopVsyncWaits, gCntIopVsyncLate;
 bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 {
     if (gNvIop == 0 || nvAccelIopAsyncBusy(this)) return false;
-    if (!gIopVsync || !gPhxFrameAbs || !fIopVblSeq) return true;
-    if (__atomic_load_n(&gPhxVblSeq, __ATOMIC_ACQUIRE) != fIopVblSeq) { fIopVblSeq = 0; return true; }
-    if (mach_absolute_time() - gIopLastAbs > 2 * gPhxFrameAbs) { OSAddAtomic64(1, &gCntIopVsyncLate); fIopVblSeq = 0; return true; }
+    unsigned head = 0;
+    if (!gIopVsync || !fIopVblSeq || !NVAccel::gAccel || !NVAccel::gAccel->pipeFramebuffer(this, &head) || !gPhxFrameAbs[head]) return true;
+    if (__atomic_load_n(&gPhxVblSeq[head], __ATOMIC_ACQUIRE) != fIopVblSeq) { fIopVblSeq = 0; return true; }
+    if (mach_absolute_time() - gIopLastAbs[head] > 2 * gPhxFrameAbs[head]) { OSAddAtomic64(1, &gCntIopVsyncLate); fIopVblSeq = 0; return true; }
     OSAddAtomic64(1, &gCntIopVsyncWaits);
     return false;
 }
@@ -1210,14 +1211,14 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         ALOG("iop: bench: reading the %ux%u source took %llu us (sum 0x%x)", w, h, ns / 1000, sum);
     }
     const uint64_t t0 = mach_absolute_time();
-    if (gPhxFrameAbs) {
-        const uint64_t prev = gIopLastAbs, fr = gPhxFrameAbs;
-        gIopLastAbs = t0;
+    if (gPhxFrameAbs[head]) {
+        const uint64_t prev = gIopLastAbs[head], fr = gPhxFrameAbs[head];
+        gIopLastAbs[head] = t0;
         if (prev && t0 > prev) {
             const uint64_t g = t0 - prev;
             OSAddAtomic64(1, &gCntIopGap[g < fr * 3 / 2 ? 0 : g < fr * 5 / 2 ? 1 : g < fr * 7 / 2 ? 2 : 3]);
         }
-        const uint64_t v = gPhxVblLastAbs;
+        const uint64_t v = gPhxVblLastAbs[head];
         if (v && t0 > v) { uint64_t ns; absolutetime_to_nanoseconds(t0 - v, &ns); OSAddAtomic64((SInt64)(ns / 1000), &gIopPhaseUsSum); }
     }
     // 8 bytes (two pixels) per access when both sides allow it: half the uncached-side transactions of the dword loop.
@@ -1257,7 +1258,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
         }
     }
     __asm__ __volatile__("sfence" ::: "memory");   // the frame is in DRAM before the transaction completes
-    fIopVblSeq = __atomic_load_n(&gPhxVblSeq, __ATOMIC_ACQUIRE);
+    fIopVblSeq = __atomic_load_n(&gPhxVblSeq[head], __ATOMIC_ACQUIRE);
     {
         uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
         const SInt64 us = (SInt64)(ns / 1000);
