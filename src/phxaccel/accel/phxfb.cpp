@@ -65,6 +65,8 @@ static constexpr uint32_t kBlMax = 1024;   // the brightness parameter's range
 class PhxAMDFB;
 static IOService *phxBacklightCreate(PhxAMDFB *fb);
 static PhxAMDFB *gPhxPanel;   // head 0
+static volatile bool gWsAsleep;      // WindowServer has the displays asleep (kIOWindowServerActiveAttribute 4)
+static thread_call_t gPanelCall;     // the panel's return to the desktop, put off until the displays are awake
 
 // The second head (boot-arg phxfb2=1): the HDMI port, display pipe 1 of the DCN. The kext writes no display register
 // for it either: a user-space tool lights the port (DMUB firmware, pixel clock, OTG1, DIG1, HUBP1 scanning this head's
@@ -433,6 +435,9 @@ public:
         if (fHead || !fBacklight) return;
         const bool want = !(fLidClosed && fSecond && fSecond->fOnline);
         if (want == fOnline) return;
+        // Coming back while the displays sleep (lid closed after the screens went dark, then opened) left the panel
+        // without its desktop picture (2026-11-15): it returns once WindowServer has woken the displays.
+        if (want && gWsAsleep) { trace("panel", 0x77616974, 1); return; }
         fOnline = want;
         uint32_t now = 0;
         if (!want) backlightWrite(0);
@@ -599,7 +604,13 @@ public:
         if (attribute == kIOWindowServerActiveAttribute) {
             // WindowServer's state for the display: 4 (kIOWSAA_Sleep) when it puts the displays to sleep, 0/1 when it
             // draws again. An external display got no other power call (no kConnectionPower, no sync control).
-            if (fHead) { const uintptr_t st = value & 0xf; if (st == 4) fConnPower = 0; else if (st <= 1) fConnPower = 1; }
+            const uintptr_t st = value & 0xf;
+            if (fHead) { if (st == 4) fConnPower = 0; else if (st <= 1) fConnPower = 1; }
+            if (st == 4) gWsAsleep = true;
+            else if (st <= 1 && gWsAsleep) {
+                gWsAsleep = false;
+                if (gPanelCall) { uint64_t d; clock_interval_to_deadline(1500, kMillisecondScale, &d); thread_call_enter_delayed(gPanelCall, d); }
+            }
             return kIOReturnSuccess;
         }
         if (attribute == kIOPowerAttribute) {
@@ -968,6 +979,7 @@ bool PhxAMDFB::start(IOService *provider)
     { extern void phxFbWakeInstall(void *); phxFbWakeInstall(this); }
     addFramebufferNotification(&PhxAMDFB::fbEvent, this, nullptr);
     gPhxPanel = this;
+    gPanelCall = thread_call_allocate([](thread_call_param_t, thread_call_param_t) { if (gPhxPanel) gPhxPanel->panelOnline(); }, nullptr);
     phxHoldInit(this, kBootHoldSec);
     phxAgdcInstall();
     if (!gAliasSysctl) { for (auto *o : kFbOids) sysctl_register_oid(o); gAliasSysctl = true; }
