@@ -439,7 +439,8 @@ public:
         else {
             uint64_t grace; nanoseconds_to_absolutetime(30000000000ull, &grace);
             fLidGraceEnd = mach_absolute_time() + grace;
-            if (!fBlDark && backlightRead(&now) && !now && fBlLastOn) backlightWrite(fBlLastOn);
+            if (fBlDark) { if (!fBlSaved) fBlSaved = fBlLastOn; }
+            else if (backlightRead(&now) && !now && fBlLastOn) backlightWrite(fBlLastOn);
         }
         trace("panel", 0x20202020, want);
         PFBLOG("panel %s (lid %s)", want ? "online" : "offline", fLidClosed ? "closed" : "open");
@@ -452,12 +453,19 @@ public:
     void displayPower(bool on) {
         if (!fBacklight || on != fBlDark) return;
         if (!on && !(backlightRead(&fBlSaved) && backlightWrite(0))) return;
+        if (!fBlSaved) fBlSaved = fBlLastOn;   // already dark (the lid): the level to come back to is the last one above 0
         fBlDark = !on;
         if (on) backlightWrite(fBlSaved);
         fBacklight->setProperty("PhxDark", fBlDark);
         PFBLOG("backlight: display power %s, level %u", on ? "on" : "off", fBlSaved);
     }
     bool backlightDark() const { return fBlDark; }
+    // the level the panel has or will come back to: what a display that attaches while the panel is dark is told
+    uint32_t backlightLevel() {
+        uint32_t now = 0;
+        if (fBlDark) return fBlSaved ? fBlSaved : fBlLastOn;
+        return backlightRead(&now) && now ? now : fBlLastOn;
+    }
     // which calls reach the panel, newest first, as the registry property PhxTrace (the brightness slider moved and no
     // brightness parameter arrived, 2026-10-25); the log does not reach the unified log
     char fTrace[40][56] = {}; unsigned fTraceN = 0;
@@ -734,7 +742,7 @@ public:
         OSDictionary *params = cur ? OSDictionary::withDictionary(cur) : OSDictionary::withCapacity(2);
         OSSafeReleaseNULL(p);
         if (!params) return false;
-        fFB->backlightRead(&fLevel);
+        fLevel = fFB->backlightLevel();
         IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, kBlMax);
         IODisplay::setParameter(params, gIODisplayBrightnessKey, (SInt32)fLevel);
         // CoreBrightness sets the linear ones, as an Intel MacBook's framebuffer offers them: with "brightness" alone
