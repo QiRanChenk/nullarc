@@ -405,7 +405,7 @@ public:
     bool fBlDark = false;
     uint32_t fBlSaved = kBlMax;
     bool backlightSet(uint32_t level) {
-        if (fBlDark) { fBlSaved = level > kBlMax ? kBlMax : level; return true; }
+        if (fBlDark) { if (level) fBlSaved = level > kBlMax ? kBlMax : level; return true; }
         return backlightWrite(level);
     }
     void displayPower(bool on) {
@@ -540,7 +540,12 @@ public:
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
         trace("attr", attribute, value);
-        if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
+        if (attribute == kIOWindowServerActiveAttribute) {
+            // WindowServer's state for the display: 4 (kIOWSAA_Sleep) when it puts the displays to sleep, 0/1 when it
+            // draws again. An external display got no other power call (no kConnectionPower, no sync control).
+            if (fHead) { const uintptr_t st = value & 0xf; if (st == 4) fConnPower = 0; else if (st <= 1) fConnPower = 1; }
+            return kIOReturnSuccess;
+        }
         if (attribute == kIOPowerAttribute) {
             displayPower(value != 0);
             if (value) { IOReturn r = IOFramebuffer::setAttribute(attribute, value); handleEvent(kIOFBNotifyDidPowerOn);
@@ -562,6 +567,10 @@ public:
             fConnPower = value != 0;
             displayPower(value != 0);
             return kIOReturnSuccess;
+        case kConnectionSyncEnable:   // an external display's power: IODisplay stops the syncs to put it to sleep
+            if (!fHead) return IOFramebuffer::setAttributeForConnection(idx, attribute, value);
+            fConnPower = (value & (kIOHSyncDisable | kIOVSyncDisable | kIOCSyncDisable)) == 0;
+            return kIOReturnSuccess;
         case kConnectionColorModesSupported: case kConnectionColorDepthsSupported:
         case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported: case kConnectionColorMode:
         case kConnectionDisplayFlags: case kConnectionFlags:
@@ -575,6 +584,9 @@ public:
         switch (attr) {
         case kConnectionEnable: case kConnectionCheckEnable: *value = fHead ? (fOnline ? 1 : 0) : 1; return kIOReturnSuccess;
         case kConnectionFlags: *value = fHead ? 0 : kIOConnectionBuiltIn; return kIOReturnSuccess;
+        case kConnectionSyncEnable:
+            if (!fHead) return IOFramebuffer::getAttributeForConnection(idx, attr, value);
+            *value = kIOHSyncDisable | kIOVSyncDisable | kIOCSyncDisable | kIONoSeparateSyncControl; return kIOReturnSuccess;
         case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
         case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:
             *value = 0x00000002; return kIOReturnSuccess;
@@ -681,6 +693,12 @@ public:
         // the slider moved and no parameter ever reached the panel (2026-10-25)
         const OSSymbol *linear[] = { gIODisplayLinearBrightnessKey, gIODisplayUsableLinearBrightnessKey };
         for (const OSSymbol *k : linear) { IODisplay::addParameter(params, k, 0, kBlMax); IODisplay::setParameter(params, k, (SInt32)fLevel); }
+        // The display's power state as its own parameter. Without it AppleBacklightDisplay signals power through
+        // "brightness" (0 = off, 1 = dim, 255 = on, IOBacklightDisplay.cpp updatePowerParam), which this handler took for
+        // levels: after the lid was closed beside an external monitor and opened again the panel stayed dark until the
+        // brightness keys were used (2026-11-15).
+        IODisplay::addParameter(params, gIODisplayPowerStateKey, 0, kIODisplayPowerStateOn);
+        IODisplay::setParameter(params, gIODisplayPowerStateKey, kIODisplayPowerStateOn);
         display->setProperty(gIODisplayParametersKey, params);
         params->release();
         PFBLOG("backlight: brightness parameter on %s, %u of %u", display->getName(), fLevel, kBlMax);
@@ -691,6 +709,11 @@ public:
     bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
         setProperty("PhxLastParam", const_cast<OSSymbol *>(paramName)); setProperty("PhxLastValue", value, 32); setProperty("PhxSets", ++fSets, 32);
         fFB->trace(paramName->getCStringNoCopy(), 0x20202020, value);
+        if (paramName == gIODisplayPowerStateKey) {
+            fFB->displayPower(value != kIODisplayPowerStateOff);
+            setProperty("PhxDark", fFB->backlightDark());
+            return true;
+        }
         setProperty("PhxDark", fFB->backlightDark());
         if (paramName != gIODisplayBrightnessKey && paramName != gIODisplayLinearBrightnessKey
             && paramName != gIODisplayUsableLinearBrightnessKey) return false;
