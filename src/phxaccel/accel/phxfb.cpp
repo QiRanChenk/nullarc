@@ -64,6 +64,7 @@ static constexpr uint32_t kBlSeqs[] = { 0, 0x2f85 - 0x2f19 };
 static constexpr uint32_t kBlMax = 1024;   // the brightness parameter's range
 class PhxAMDFB;
 static IOService *phxBacklightCreate(PhxAMDFB *fb);
+static PhxAMDFB *gPhxPanel;   // head 0
 
 // The second head (boot-arg phxfb2=1): the HDMI port, display pipe 1 of the DCN. The kext writes no display register
 // for it either: a user-space tool lights the port (DMUB firmware, pixel clock, OTG1, DIG1, HUBP1 scanning this head's
@@ -357,6 +358,7 @@ public:
         PFBLOG("head 1: %s (%ux%u pitch %u, %u mHz, mode id %d, EDID %u bytes)", fOnline ? "online" : "offline", fWidth, fHeight,
                fRowBytes / 4, fRefreshMilliHz, (int)fModeID, fCfg.edidLen);
         if (fConnect.proc) fConnect.proc(fConnect.target, fConnect.ref);
+        if (gPhxPanel) gPhxPanel->panelOnline();   // a closed lid: the panel follows the monitor
         return kIOReturnSuccess;
     }
     bool hasDDCConnect(IOIndex) override { return fHead && fOnline && fCfg.edidLen >= 128; }
@@ -421,12 +423,27 @@ public:
         fLidClosed = closed;
         setProperty("PhxLid", ++fLidEvents << 1 | (closed ? 1u : 0u), 32);
         trace("lid", 0x20202020, closed);
-        if (closed || !fBacklight) return;
-        uint64_t grace; nanoseconds_to_absolutetime(30000000000ull, &grace);
-        fLidGraceEnd = mach_absolute_time() + grace;
+        panelOnline();
+    }
+    // As on a MacBook, the panel leaves the desktop while the lid is closed beside an external monitor and comes
+    // back when the lid opens (or the monitor goes): reported to IOGraphics as a connection change. Left online and
+    // only darkened, the panel kept windows nobody could see, and corebrightnessd lost track of its level over the
+    // lid ("ClamshellUpdate ... result=0": the slider showed full brightness on a dimmer panel, 2026-11-15).
+    void panelOnline() {
+        if (fHead || !fBacklight) return;
+        const bool want = !(fLidClosed && fSecond && fSecond->fOnline);
+        if (want == fOnline) return;
+        fOnline = want;
         uint32_t now = 0;
-        if (fBlDark) { if (!fBlSaved) fBlSaved = fBlLastOn; }
-        else if (backlightRead(&now) && !now && fBlLastOn) { backlightWrite(fBlLastOn); PFBLOG("backlight: lid opened, level %u again", fBlLastOn); }
+        if (!want) backlightWrite(0);
+        else {
+            uint64_t grace; nanoseconds_to_absolutetime(30000000000ull, &grace);
+            fLidGraceEnd = mach_absolute_time() + grace;
+            if (!fBlDark && backlightRead(&now) && !now && fBlLastOn) backlightWrite(fBlLastOn);
+        }
+        trace("panel", 0x20202020, want);
+        PFBLOG("panel %s (lid %s)", want ? "online" : "offline", fLidClosed ? "closed" : "open");
+        if (fConnect.proc) fConnect.proc(fConnect.target, fConnect.ref);
     }
     static IOReturn fbEvent(OSObject *self, void *, IOFramebuffer *, IOIndex event, void *info) {
         if (event == kIOFBNotifyClamshellChange) static_cast<PhxAMDFB *>(self)->lidChanged(info == kOSBooleanTrue);
@@ -444,11 +461,16 @@ public:
     // which calls reach the panel, newest first, as the registry property PhxTrace (the brightness slider moved and no
     // brightness parameter arrived, 2026-10-25); the log does not reach the unified log
     char fTrace[40][56] = {}; unsigned fTraceN = 0;
+    static bool strstr_brightness(const char *b) { return !strncmp(b, "linear-brightness", 17) || !strncmp(b, "brightness", 10); }
     void trace(const char *what, uint32_t a, uint64_t v) {
         enum { kN = sizeof fTrace / sizeof fTrace[0] };
         char body[44]; snprintf(body, sizeof body, "%s %c%c%c%c=0x%llx", what, (char)(a >> 24), (char)(a >> 16), (char)(a >> 8), (char)a,
                                 (unsigned long long)v);
-        if (fTraceN && !strcmp(body, strchr(fTrace[(fTraceN - 1) % kN], ' ') + 1)) return;   // repeats of the last call
+        if (!strncmp(body, "flush", 5) || !strncmp(body, "conn flus", 9) || strchr(body, '*')) return;   // one per brightness step is enough
+        if (fTraceN) {   // a run of one call keeps its last value
+            const char *last = strchr(fTrace[(fTraceN - 1) % kN], ' ') + 1; const char *eq = strchr(body, '=');
+            if (eq && strstr_brightness(body) && !strncmp(body, last, (size_t)(eq - body + 1))) fTraceN--;
+        }
         uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
         snprintf(fTrace[fTraceN++ % kN], sizeof fTrace[0], "%llu.%llu %s", ns / 1000000000ull, ns / 100000000ull % 10, body);   // uptime, seconds
         char all[kN * 58 + 16] = ""; for (unsigned i = 0; i < kN && i < fTraceN; i++) { strlcat(all, fTrace[(fTraceN - 1 - i) % kN], sizeof all); strlcat(all, "; ", sizeof all); }
@@ -608,7 +630,7 @@ public:
         if (attr == kConnectionSupportsHLDDCSense && fHead && idx == 0) return kIOReturnSuccess;   // hasDDCConnect/getDDCBlock
         if (idx != 0 || !value) return kIOReturnBadArgument;
         switch (attr) {
-        case kConnectionEnable: case kConnectionCheckEnable: *value = fHead ? (fOnline ? 1 : 0) : 1; return kIOReturnSuccess;
+        case kConnectionEnable: case kConnectionCheckEnable: *value = fOnline ? 1 : 0; return kIOReturnSuccess;
         case kConnectionFlags: *value = fHead ? 0 : kIOConnectionBuiltIn; return kIOReturnSuccess;
         case kConnectionSyncEnable:
             if (!fHead) return IOFramebuffer::getAttributeForConnection(idx, attr, value);
@@ -937,6 +959,7 @@ bool PhxAMDFB::start(IOService *provider)
     registerPowerDriver(this, states, 2);
     { extern void phxFbWakeInstall(void *); phxFbWakeInstall(this); }
     addFramebufferNotification(&PhxAMDFB::fbEvent, this, nullptr);
+    gPhxPanel = this;
     phxHoldInit(this, kBootHoldSec);
     phxAgdcInstall();
     if (!gAliasSysctl) { for (auto *o : kFbOids) sysctl_register_oid(o); gAliasSysctl = true; }
@@ -967,7 +990,17 @@ static int sysctl_fbwake SYSCTL_HANDLER_ARGS {
 SYSCTL_PROC(_debug, OID_AUTO, phxfb_wake, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_fbwake, "I",
             "write 1 after a system wake, once the GPU is up again: lets WindowServer back into the framebuffer");
 
-void phxFbWakeInstall(void *fb) { if (!gFbSelf[0]) { gFbSelf[0] = static_cast<PhxAMDFB *>(fb); sysctl_register_oid(&sysctl__debug_phxfb_wake); } }
+static int sysctl_fblid SYSCTL_HANDLER_ARGS {
+    int v = -1;
+    int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr) return err;
+    if (gFbSelf[0] && (v == 0 || v == 1)) gFbSelf[0]->lidChanged(v == 1);
+    return 0;
+}
+SYSCTL_PROC(_debug, OID_AUTO, phxfb_lid, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sysctl_fblid, "I",
+            "test: 1 = act as if the lid closed, 0 = as if it opened (the panel leaves the desktop beside an external monitor)");
+
+void phxFbWakeInstall(void *fb) { if (!gFbSelf[0]) { gFbSelf[0] = static_cast<PhxAMDFB *>(fb); sysctl_register_oid(&sysctl__debug_phxfb_wake); sysctl_register_oid(&sysctl__debug_phxfb_lid); } }
 
 static int sysctl_fb1config SYSCTL_HANDLER_ARGS {
     PhxAMDFB *fb = gFbSelf[1];
@@ -1002,12 +1035,13 @@ static void phxFb1Install() { if (!gFb1Sysctl) { for (auto *o : kFb1Oids) sysctl
 void PhxAMDFB::stop(IOService *provider)
 {
     fStopping = true;
+    if (gPhxPanel == this) gPhxPanel = nullptr;
     if (fSecond) { fSecond->terminate(kIOServiceRequired | kIOServiceSynchronous); OSSafeReleaseNULL(fSecond); }
     if (fHead) {
         if (gFbSelf[1] == this) gFbSelf[1] = nullptr;
         if (gFb1Sysctl) { for (auto *o : kFb1Oids) sysctl_unregister_oid(o); gFb1Sysctl = false; }
     } else {
-        if (gFbSelf[0] == this) { gFbSelf[0] = nullptr; sysctl_unregister_oid(&sysctl__debug_phxfb_wake); }
+        if (gFbSelf[0] == this) { gFbSelf[0] = nullptr; sysctl_unregister_oid(&sysctl__debug_phxfb_wake); sysctl_unregister_oid(&sysctl__debug_phxfb_lid); }
         phxAgdcRemove();
         if (gAliasSysctl) { for (auto *o : kFbOids) sysctl_unregister_oid(o); gAliasSysctl = false; }
     }
