@@ -407,7 +407,7 @@ public:
     // The lid beside an external monitor (clamshell, the Mac stays awake): CoreBrightness sets the panel's level to 0
     // when the lid closes and does not bring it back when it opens; the panel stayed dark until the brightness keys
     // were used (2026-11-15). The last level above 0 comes back when the lid opens, and a 0 that arrives in the
-    // seconds after that is dropped.
+    // half minute after that is dropped.
     uint32_t fBlLastOn = 0, fLidEvents = 0;
     bool fLidClosed = false;
     uint64_t fLidGraceEnd = 0;
@@ -420,8 +420,9 @@ public:
     void lidChanged(bool closed) {
         fLidClosed = closed;
         setProperty("PhxLid", ++fLidEvents << 1 | (closed ? 1u : 0u), 32);
+        trace("lid", 0x20202020, closed);
         if (closed || !fBacklight) return;
-        uint64_t grace; nanoseconds_to_absolutetime(5000000000ull, &grace);
+        uint64_t grace; nanoseconds_to_absolutetime(30000000000ull, &grace);
         fLidGraceEnd = mach_absolute_time() + grace;
         uint32_t now = 0;
         if (fBlDark) { if (!fBlSaved) fBlSaved = fBlLastOn; }
@@ -442,13 +443,15 @@ public:
     bool backlightDark() const { return fBlDark; }
     // which calls reach the panel, newest first, as the registry property PhxTrace (the brightness slider moved and no
     // brightness parameter arrived, 2026-10-25); the log does not reach the unified log
-    char fTrace[16][48] = {}; unsigned fTraceN = 0;
+    char fTrace[40][56] = {}; unsigned fTraceN = 0;
     void trace(const char *what, uint32_t a, uint64_t v) {
-        char line[48]; snprintf(line, sizeof line, "%s %c%c%c%c=0x%llx", what, (char)(a >> 24), (char)(a >> 16), (char)(a >> 8), (char)a,
+        enum { kN = sizeof fTrace / sizeof fTrace[0] };
+        char body[44]; snprintf(body, sizeof body, "%s %c%c%c%c=0x%llx", what, (char)(a >> 24), (char)(a >> 16), (char)(a >> 8), (char)a,
                                 (unsigned long long)v);
-        if (fTraceN && !strcmp(line, fTrace[(fTraceN - 1) % 16])) return;   // repeats of the last call
-        strlcpy(fTrace[fTraceN++ % 16], line, sizeof fTrace[0]);
-        char all[16 * 48 + 16] = ""; for (unsigned i = 0; i < 16 && i < fTraceN; i++) { strlcat(all, fTrace[(fTraceN - 1 - i) % 16], sizeof all); strlcat(all, "; ", sizeof all); }
+        if (fTraceN && !strcmp(body, strchr(fTrace[(fTraceN - 1) % kN], ' ') + 1)) return;   // repeats of the last call
+        uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+        snprintf(fTrace[fTraceN++ % kN], sizeof fTrace[0], "%llu.%llu %s", ns / 1000000000ull, ns / 100000000ull % 10, body);   // uptime, seconds
+        char all[kN * 58 + 16] = ""; for (unsigned i = 0; i < kN && i < fTraceN; i++) { strlcat(all, fTrace[(fTraceN - 1 - i) % kN], sizeof all); strlcat(all, "; ", sizeof all); }
         setProperty("PhxTrace", all);
     }
     // the built-in panel is a TFT: AppleBacklightDisplay then drives it (brightness, dimming), as on a MacBook
