@@ -427,8 +427,49 @@ public:
     uint32_t fBlLastOn = 0, fLidEvents = 0;
     bool fLidClosed = false;
     uint64_t fLidGraceEnd = 0;
+    // The level the user chose (the last one above 0 that macOS set), kept in NVRAM as phx-backlight. The firmware
+    // starts the PWM at full duty at every boot and after a wake from hibernation, and the parameter published from
+    // the hardware then told CoreBrightness "full" ("Linear brightness after wake: 1.000000"): the panel came back at
+    // full brightness now and then (2026-11-15). The panel is set to this level when the framebuffer starts and after
+    // a wake, and it is what the brightness parameter reports.
+    uint32_t fBlUser = 0;
+    thread_call_t fBlSaveCall = nullptr;
+    static void blSave(thread_call_param_t me, thread_call_param_t) {
+        PhxAMDFB *fb = static_cast<PhxAMDFB *>(me);
+        IORegistryEntry *opts = IORegistryEntry::fromPath("/options", gIODTPlane);
+        if (!opts) return;
+        const uint32_t v = fb->fBlUser;
+        if (v) if (OSData *d = OSData::withBytes(&v, sizeof v)) { opts->setProperty("phx-backlight", d); d->release(); }
+        opts->release();
+    }
+    static uint32_t blLoad() {
+        uint32_t v = 0;
+        IORegistryEntry *opts = IORegistryEntry::fromPath("/options", gIODTPlane);
+        if (!opts) return 0;
+        OSObject *o = opts->copyProperty("phx-backlight");     // NVRAM: copyProperty, getProperty does not reach the variables
+        if (OSData *d = OSDynamicCast(OSData, o)) if (d->getLength() == sizeof v) memcpy(&v, d->getBytesNoCopy(), sizeof v);
+        OSSafeReleaseNULL(o);
+        opts->release();
+        return v >= kBlMax / 64 && v <= kBlMax ? v : 0;
+    }
+    void blRemember(uint32_t level) {
+        if (!level || level == fBlUser) return;
+        fBlUser = level > kBlMax ? kBlMax : level;
+        if (!fBlSaveCall) fBlSaveCall = thread_call_allocate(blSave, this);
+        uint64_t d; clock_interval_to_deadline(5, kSecondScale, &d);    // once the slider has settled
+        if (fBlSaveCall) thread_call_enter_delayed(fBlSaveCall, d);
+    }
+    // after a wake: the firmware's full duty back to the user's level
+    void blReapply() {
+        uint32_t now = 0;
+        if (fHead || !fBacklight || !fBlUser || fBlDark || !fOnline) return;
+        if (backlightRead(&now) && now && (now > fBlUser + kBlMax / 100 || now + kBlMax / 100 < fBlUser)) {
+            backlightWrite(fBlUser); PFBLOG("backlight: back to the user's level %u (was %u)", fBlUser, now);
+        }
+    }
     bool backlightSet(uint32_t level) {
         if (level) fBlLastOn = level > kBlMax ? kBlMax : level;
+        blRemember(level);
         if (fBlDark) { if (level) fBlSaved = fBlLastOn; return true; }
         if (!level && !fLidClosed && mach_absolute_time() < fLidGraceEnd) return true;
         return backlightWrite(level);
@@ -457,7 +498,8 @@ public:
             uint64_t grace; nanoseconds_to_absolutetime(30000000000ull, &grace);
             fLidGraceEnd = mach_absolute_time() + grace;
             if (fBlDark) { if (!fBlSaved) fBlSaved = fBlLastOn; }
-            else if (backlightRead(&now) && !now && fBlLastOn) backlightWrite(fBlLastOn);
+            else if (backlightRead(&now) && !now && (fBlUser || fBlLastOn)) backlightWrite(fBlUser ? fBlUser : fBlLastOn);
+            else blReapply();
         }
         trace("panel", 0x20202020, want);
         PFBLOG("panel %s (lid %s)", want ? "online" : "offline", fLidClosed ? "closed" : "open");
@@ -470,7 +512,8 @@ public:
     void displayPower(bool on) {
         if (!fBacklight || on != fBlDark) return;
         if (!on && !(backlightRead(&fBlSaved) && backlightWrite(0))) return;
-        if (!fBlSaved) fBlSaved = fBlLastOn;   // already dark (the lid): the level to come back to is the last one above 0
+        if (!fBlSaved) fBlSaved = fBlUser ? fBlUser : fBlLastOn;   // already dark (the lid): the level to come back to is the last one above 0
+        if (on && fBlUser) fBlSaved = fBlUser;   // not what the firmware left in the PWM over a hibernation
         fBlDark = !on;
         if (on) backlightWrite(fBlSaved);
         fBacklight->setProperty("PhxDark", fBlDark);
@@ -480,7 +523,8 @@ public:
     // the level the panel has or will come back to: what a display that attaches while the panel is dark is told
     uint32_t backlightLevel() {
         uint32_t now = 0;
-        if (fBlDark) return fBlSaved ? fBlSaved : fBlLastOn;
+        if (fBlDark) return fBlSaved ? fBlSaved : fBlUser ? fBlUser : fBlLastOn;
+        if (fBlUser) return fBlUser;
         return backlightRead(&now) && now ? now : fBlLastOn;
     }
     // which calls reach the panel, newest first, as the registry property PhxTrace (the brightness slider moved and no
@@ -610,6 +654,7 @@ public:
         if (wl) wl->runAction(&PhxAMDFB::wakeGated, this); else pagingState = true;
         deliverFramebufferNotification(kIOFBNotifyDidWake, (void *)true);
         deliverFramebufferNotification(kIOFBNotifyDidPowerOn, (void *)false);   // the pair IOFBController sends after a power-up
+        blReapply();
     }
     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
         trace("attr", attribute, value);
@@ -968,7 +1013,10 @@ bool PhxAMDFB::start(IOService *provider)
     if (PE_parse_boot_argn("-phxbloff", arg, sizeof arg)) PFBLOG("backlight: -phxbloff, no brightness control");
     else if (!backlightRead(&bl)) PFBLOG("backlight: the PWM is not running (no MMIO view, or off), no brightness control");
     else if (!(fBacklight = phxBacklightCreate(this))) PFBLOG("backlight: the handler would not attach");
-    else { PFBLOG("backlight: PWM at %u of %u", bl, kBlMax); fBlLastOn = bl; }
+    else {
+        PFBLOG("backlight: PWM at %u of %u", bl, kBlMax); fBlLastOn = bl;
+        if (const uint32_t u = blLoad()) { fBlUser = fBlLastOn = u; backlightWrite(u); PFBLOG("backlight: the user's level %u from NVRAM", u); }
+    }
     if (!IOFramebuffer::start(provider)) {
         if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
         OSSafeReleaseNULL(fMmio); OSSafeReleaseNULL(fSurfMap); return false; }
@@ -1090,6 +1138,7 @@ void PhxAMDFB::stop(IOService *provider)
         if (gAliasSysctl) { for (auto *o : kFbOids) sysctl_unregister_oid(o); gAliasSysctl = false; }
     }
     if (fVblTimer) { thread_call_cancel(fVblTimer); while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); } fVblTimer = nullptr; }
+    if (fBlSaveCall) { thread_call_cancel(fBlSaveCall); while (!thread_call_free(fBlSaveCall)) { thread_call_cancel(fBlSaveCall); IOSleep(5); } fBlSaveCall = nullptr; }
     gPhxFrameAbs[fHead] = 0;
     if (fBacklight) { fBacklight->terminate(); OSSafeReleaseNULL(fBacklight); }
     OSSafeReleaseNULL(fMmio);
