@@ -565,10 +565,25 @@ public:
     }
     IODeviceMemory *getVRAMRange() override { return getApertureRange(kIOFBSystemAperture); }
     const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
-    IOItemCount getDisplayModeCount() override { return 1; }
-    IOReturn getDisplayModes(IODisplayModeID *modes) override { modes[0] = fModeID; return kIOReturnSuccess; }
+    // Probe (scaled-probe branch): the panel also lists larger rasters macOS could halve into HiDPI 1440x900, 1680x1050
+    // and 1920x1200. They are listed only; setDisplayMode refuses them (no scaler is programmed yet). -phxscaleoff: off.
+    static constexpr uint32_t kXW[3] = { 2880, 3360, 3840 }, kXH[3] = { 1800, 2100, 2400 };
+    bool fXModes = false;
+    int xmode(IODisplayModeID m) const { return (fXModes && m >= 2 && m <= 4) ? (int)m - 2 : -1; }
+    IOItemCount getDisplayModeCount() override { return fXModes ? 4 : 1; }
+    IOReturn getDisplayModes(IODisplayModeID *modes) override {
+        modes[0] = fModeID; if (fXModes) for (int i = 0; i < 3; i++) modes[1 + i] = 2 + i;
+        return kIOReturnSuccess; }
     IOReturn getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info) override {
-        if (mode != fModeID || !info) return kIOReturnBadArgument;
+        if (!info) return kIOReturnBadArgument;
+        if (const int x = xmode(mode); x >= 0) {
+            bzero(info, sizeof(*info));
+            info->nominalWidth = kXW[x]; info->nominalHeight = kXH[x];
+            info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMilliHz << 16) / 1000);
+            info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeValidForHiResFlag;
+            return kIOReturnSuccess;
+        }
+        if (mode != fModeID) return kIOReturnBadArgument;
         bzero(info, sizeof(*info));
         info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
         info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMilliHz << 16) / 1000);
@@ -580,20 +595,23 @@ public:
     }
     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
     IOReturn getPixelInformation(IODisplayModeID mode, IOIndex depth, IOPixelAperture aperture, IOPixelInformation *pi) override {
-        if (mode != fModeID || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
+        const int x = xmode(mode);
+        if ((mode != fModeID && x < 0) || depth != 0 || aperture != kIOFBSystemAperture || !pi) return kIOReturnUnsupportedMode;
         bzero(pi, sizeof(*pi));
-        pi->bytesPerRow = fRowBytes; pi->bitsPerPixel = 32; pi->pixelType = kIORGBDirectPixels;
+        pi->bytesPerRow = x >= 0 ? kXW[x] * 4 : fRowBytes; pi->bitsPerPixel = 32; pi->pixelType = kIORGBDirectPixels;
         pi->componentCount = 3; pi->bitsPerComponent = 8;
         pi->componentMasks[0] = 0x00FF0000; pi->componentMasks[1] = 0x0000FF00; pi->componentMasks[2] = 0x000000FF;
         strlcpy(pi->pixelFormat, IO32BitDirectPixels, sizeof(pi->pixelFormat));
-        pi->activeWidth = fWidth; pi->activeHeight = fHeight;
+        pi->activeWidth = x >= 0 ? kXW[x] : fWidth; pi->activeHeight = x >= 0 ? kXH[x] : fHeight;
         return kIOReturnSuccess;
     }
     IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = fModeID; *depth = 0; return kIOReturnSuccess; }
     IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { return getCurrentDisplayMode(mode, depth); }
-    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override { return (mode == fModeID && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
+    IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override {
+        if (xmode(mode) >= 0) { PFBLOG("probe: setDisplayMode(%d) asked for %ux%u, refused (no scaler yet)", (int)mode, kXW[xmode(mode)], kXH[xmode(mode)]); return kIOReturnUnsupported; }
+        return (mode == fModeID && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override {
-        if (mode != fModeID || !info) return kIOReturnUnsupportedMode;
+        if ((mode != fModeID && xmode(mode) < 0) || !info) return kIOReturnUnsupportedMode;
         bzero(info, sizeof(*info));
         info->appleTimingID = kIOTimingIDInvalid;   // no detailed timing: the panel keeps the firmware's
         if (fHead && fCfg.pixelClockKHz) {          // the monitor's: the timing the tool programmed
@@ -1023,6 +1041,7 @@ bool PhxAMDFB::start(IOService *provider)
         if (const uint32_t u = blLoad()) { fBlUser = fBlLastOn = u; backlightWrite(u); PFBLOG("backlight: the user's level %u from NVRAM", u); }
     }
     fHiRes = !PE_parse_boot_argn("-phxhidpioff", arg, sizeof arg);   // start() is the panel (head 0)
+    fXModes = fHiRes && !PE_parse_boot_argn("-phxscaleoff", arg, sizeof arg);
     setProperty("PhxFBHiResModeFlag", fHiRes);
     PFBLOG("HiRes (HiDPI) mode flag %s for %ux%u", fHiRes ? "on" : "off (-phxhidpioff)", fWidth, fHeight);
     if (!IOFramebuffer::start(provider)) {
