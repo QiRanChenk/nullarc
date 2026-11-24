@@ -110,6 +110,7 @@ class PhxAMDFB : public IOFramebuffer {
     volatile UInt32 fAliasBusy = 0;
     struct Irq { IOFBInterruptProc proc = nullptr; OSObject *target = nullptr; void *ref = nullptr; };
     Irq fVbl[4], fConnect;   // IOFramebuffer itself and, when it asks, IOAccelDisplayPipe each register a VBL handler
+    bool fHiRes = false;               // advertise kDisplayModeValidForHiResFlag (panel, unless -phxhidpioff)
     unsigned fHead = 0;                // 0 = the panel, 1 = the HDMI port, 2 = the USB-C port (phxfb3)
     PhxAMDFB *fExt[kPhxExtHeads] = {}; // head 0 keeps the heads it created
     bool extOnline() const { for (PhxAMDFB *e : fExt) if (e && e->fOnline) return true; return false; }
@@ -570,7 +571,11 @@ public:
         if (mode != fModeID || !info) return kIOReturnBadArgument;
         bzero(info, sizeof(*info));
         info->maxDepthIndex = 0; info->nominalWidth = fWidth; info->nominalHeight = fHeight;
-        info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMilliHz << 16) / 1000); info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag | kFramebufferSupportsGammaCorrection;
+        info->refreshRate = (IOFixed1616)(((uint64_t)fRefreshMilliHz << 16) / 1000);
+        info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
+        // Let CoreDisplay offer a 2x (HiDPI) logical mode backed by this same raster; no new timing or buffer size.
+        // Panel only (head 0); -phxhidpioff turns it off. (After dandingdjianjiao's thinkbook-hidpi-fb branch.)
+        if (fHiRes) info->flags |= kDisplayModeValidForHiResFlag;
         return kIOReturnSuccess;
     }
     UInt64 getPixelFormatsForDisplayMode(IODisplayModeID, IOIndex) override { return 0; }
@@ -1017,6 +1022,9 @@ bool PhxAMDFB::start(IOService *provider)
         PFBLOG("backlight: PWM at %u of %u", bl, kBlMax); fBlLastOn = bl;
         if (const uint32_t u = blLoad()) { fBlUser = fBlLastOn = u; backlightWrite(u); PFBLOG("backlight: the user's level %u from NVRAM", u); }
     }
+    fHiRes = !PE_parse_boot_argn("-phxhidpioff", arg, sizeof arg);   // start() is the panel (head 0)
+    setProperty("PhxFBHiResModeFlag", fHiRes);
+    PFBLOG("HiRes (HiDPI) mode flag %s for %ux%u", fHiRes ? "on" : "off (-phxhidpioff)", fWidth, fHeight);
     if (!IOFramebuffer::start(provider)) {
         if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
         OSSafeReleaseNULL(fMmio); OSSafeReleaseNULL(fSurfMap); return false; }
