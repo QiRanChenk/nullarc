@@ -249,6 +249,7 @@ static const char *nvmtl_nvenc_library_for_this_gpu(void)
     if (!strcmp(gen, "Turing")) return "libnvenc_h264_tu10x.dylib";
     return NULL;
 }
+#include "NVMTLPhxdec.m"
 static void nvmtl_nvdec_register(void)
 {
     static dispatch_once_t once;
@@ -577,6 +578,8 @@ static void nvmtl_install_hw_resource_pools(id dev)
         return nil;
     }
     nvmtl_gl_caps_enable();
+    if (nvmtl_vk_vendor() == 0x1002)
+        nvmtl_phxdec_register();   /* VCN: H.264 / HEVC / AV1 through libphxdec_hevc.dylib, when it is installed */
     if (nvmtl_vk_vendor() == 0x10de) {   /* NVDEC/NVENC are NVIDIA engines reached through NVRM */
         nvmtl_nvdec_register();
         nvmtl_nvenc_register();
