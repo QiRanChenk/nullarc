@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 41u
+#define PHX_KEXT_BUILD 42u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -85,7 +85,11 @@ static constexpr uint32_t kFaultEnableDefault = 0x00001FFCu;
 static int gFaultDef = 1;
 // GC TLB invalidation (engine 17): how often the ack bit was already set when the request was written, how often it
 // did not come within the bound, and the longest wait
-static volatile SInt32 gInvCount, gInvStaleAck, gInvTimeouts;
+static volatile SInt32 gInvCount, gInvStaleAck, gInvTimeouts, gRingFlushes;
+// debug.phx_ringflush (default 1): compute submissions flush their VMID in the ring when its tables changed
+static int gRingFlush = 1;
+SYSCTL_INT(_debug, OID_AUTO, phx_ringflush, CTLFLAG_RW | CTLFLAG_LOCKED, &gRingFlush, 0,
+           "1: in-ring VM flush on the compute queue (gfx_v11_0_ring_emit_vm_flush)");
 static uint32_t gInvMaxUs;
 static IOBufferMemoryDescriptor *gFaultPage;
 static uint32_t gFaultDefApplied;
@@ -343,6 +347,9 @@ private:
         volatile uint32_t head, tail;
         uint64_t lastDone, lastProgress;        // the hang watchdog's view: fence seen last, and when it last moved
         uint64_t killedSeq; bool killedAll;
+        // compute queue: the context and table generation each hardware VMID last ran with on this queue; a
+        // submission that finds them changed flushes the VMID in the ring first (gpuSubmit)
+        uint32_t seenCtx[8], seenGen[8];
     };
     GpuQueue gq[3]{};   // compute, gfx, VCN0 (unified ring)
     uint64_t gSeq{0};
@@ -362,6 +369,7 @@ private:
         uint32_t pages, used;
         bool busy;
         uint32_t hw;                      // the hardware VMID pointed at these tables, 0 = none
+        uint32_t gen;                     // bumped whenever the tables or the VMID binding change (in-ring flush)
     };
     static constexpr uint32_t kMaxCtx = 96;
     VmCtx vm[kMaxCtx]{};
@@ -610,6 +618,7 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_unregister_oid(&sysctl__debug_phx_ringflush);
         sysctl_unregister_oid(&sysctl__debug_phx_vmwalk_vmid);
         sysctl_unregister_oid(&sysctl__debug_phx_vmwalk_va);
         sysctl_unregister_oid(&sysctl__debug_phx_vmwalk);
@@ -840,6 +849,7 @@ static constexpr uint64_t kPtAddrMask = 0x0000FFFFFFFFF000ull;
 // invalidation engine 17
 static constexpr uint32_t kRegCtx0Cntl = 0x28E8, kRegCtx0BaseLo = 0x2953, kRegCtx0StartLo = 0x2973, kRegCtx0EndLo = 0x2993;
 static constexpr uint32_t kRegInvEng17Req = 0x291C, kRegInvEng17Ack = 0x292E;
+static constexpr uint32_t kRegInvEng1Req = 0x290C, kRegInvEng1Ack = 0x291E;   // engine 1: the compute queue's own
 
 static inline void flushLine(const volatile void *p) {
     __asm__ __volatile__("clflush (%0)" ::"r"(p) : "memory");
@@ -999,6 +1009,7 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     h.lastUse = now;
     const uint32_t vmid = kFirstUserVmid + static_cast<uint32_t>(pick);
     c.hw = vmid;
+    c.gen++;
     GfxGuard awake(this);
     wreg(kRegCtx0BaseLo + 2 * vmid, static_cast<uint32_t>(c.phys | 3));
     wreg(kRegCtx0BaseLo + 2 * vmid + 1, static_cast<uint32_t>(c.phys >> 32));
@@ -1127,6 +1138,7 @@ IOReturn PhxBringup::vmMap(uint32_t handle, uint64_t va, IOMemoryDescriptor *md,
         *pte = (pa & kPtAddrMask) | kPteSysFlags;
         flushLine(pte);
     }
+    c.gen++;
     if (c.hw)   // an unbound context is flushed when it is next bound
         vmFlushTlb(c.hw);
     IOLockUnlock(gpuLock);
@@ -1145,6 +1157,7 @@ IOReturn PhxBringup::vmUnmap(uint32_t handle, uint64_t va, uint64_t size) {
             flushLine(pte);
         }
     }
+    c.gen++;
     if (c.hw)
         vmFlushTlb(c.hw);
     IOLockUnlock(gpuLock);
@@ -1214,7 +1227,8 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     if (!qp->ready || !vmCtx(handle))
         return kIOReturnNotReady;
     GpuQueue &q = *qp;
-    const uint32_t need = n * 4 + 8;
+    // + 17: the in-ring VM flush a compute submission may need (below)
+    const uint32_t need = n * 4 + 8 + (q.gfx ? 0u : 17u);
     if (need + 16 > q.ringDw)
         return kIOReturnBadArgument;
     IOLockLock(gpuLock);
@@ -1239,6 +1253,37 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
         return kIOReturnBusy;
     }
     uint32_t k = 0;
+    if (!q.gfx && gRingFlush) {
+        // gfx_v11_0_ring_emit_vm_flush on the compute queue: the page-table base and a TLB invalidation of this VMID,
+        // executed by the compute pipe itself (invalidation engine 1) right before the IBs. The MMIO invalidation
+        // (engine 17, vmFlushTlb) did not reach that pipe reliably: the second process to use a VMID faulted on an IB
+        // that was mapped (2026-11-25: kext walk valid, hub fault at the same VA), and the queue then stopped.
+        VmCtx &c = vm[handle - 1];
+        const uint32_t vi = vmid - kFirstUserVmid;
+        if (q.seenCtx[vi] != handle || q.seenGen[vi] != c.gen) {
+            const uint64_t base = c.phys | 3;
+            ringPut(q, k++, 0xC0033700);                           // WRITE_DATA, dst register, engine ME
+            ringPut(q, k++, 0);
+            ringPut(q, k++, kRegCtx0BaseLo + 2 * vmid);
+            ringPut(q, k++, 0);
+            ringPut(q, k++, static_cast<uint32_t>(base));
+            ringPut(q, k++, 0xC0033700);
+            ringPut(q, k++, 0);
+            ringPut(q, k++, kRegCtx0BaseLo + 2 * vmid + 1);
+            ringPut(q, k++, 0);
+            ringPut(q, k++, static_cast<uint32_t>(base >> 32));
+            ringPut(q, k++, 0xC0053C00);                           // WAIT_REG_MEM: write reg0, wait (reg1 & mask) == ref
+            ringPut(q, k++, 0x00000043);                           // register space, operation 1, function 3 (equal)
+            ringPut(q, k++, kRegInvEng1Req);
+            ringPut(q, k++, kRegInvEng1Ack);
+            ringPut(q, k++, 0x00F80000u | (1u << vmid));
+            ringPut(q, k++, 1u << vmid);
+            ringPut(q, k++, 0x20);                                 // poll interval
+            q.seenCtx[vi] = handle;
+            q.seenGen[vi] = c.gen;
+            OSIncrementAtomic(&gRingFlushes);
+        }
+    }
     for (uint32_t i = 0; i < n; i++) {
         ringPut(q, k++, 0xC0023F00);                               // INDIRECT_BUFFER
         // the CP wants the canonical (sign-extended) address: an upper-half IB (bit 47, where RADV puts them) with a
@@ -1349,10 +1394,10 @@ int PhxBringup::gcFaultStat(char *b, size_t n) {
         return snprintf(b, n, "gpu not ready");
     GfxGuard awake(this);
     const uint32_t st = rreg(kRegFaultStatus);
-    return snprintf(b, n, "applied %u; FAULT_CNTL 0x%08x DEFAULT 0x%x_%08x; STATUS 0x%08x (vmid %u cid %u rw %u) ADDR 0x%x_%08x (page); tlb flushes %d stale-ack %d timeouts %d max %u us",
+    return snprintf(b, n, "applied %u; FAULT_CNTL 0x%08x DEFAULT 0x%x_%08x; STATUS 0x%08x (vmid %u cid %u rw %u) ADDR 0x%x_%08x (page); tlb flushes %d stale-ack %d timeouts %d max %u us; ring flushes %d",
                     gFaultDefApplied, rreg(kRegFaultCntl), rreg(kRegFaultDefHi), rreg(kRegFaultDefLo), st, (st >> 20) & 15,
                     (st >> 9) & 0x1ff, (st >> 18) & 1, rreg(kRegFaultAddrHi), rreg(kRegFaultAddrLo), (int)gInvCount, (int)gInvStaleAck,
-                    (int)gInvTimeouts, gInvMaxUs);
+                    (int)gInvTimeouts, gInvMaxUs, (int)gRingFlushes);
 }
 
 // gpuLock held (or no submitter left): the hardware state behind the VCN queue and the MMHUB setup is gone
@@ -2381,6 +2426,7 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phx_hang_ms);
         sysctl_register_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_register_oid(&sysctl__debug_phx_ringflush);
         sysctl_register_oid(&sysctl__debug_phx_vmwalk_vmid);
         sysctl_register_oid(&sysctl__debug_phx_vmwalk_va);
         sysctl_register_oid(&sysctl__debug_phx_vmwalk);
