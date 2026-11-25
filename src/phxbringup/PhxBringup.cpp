@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 43u
+#define PHX_KEXT_BUILD 44u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -78,6 +78,7 @@ static volatile SInt32 gVcnStuck, gVcnStuckCount;   // a VCN job older than 2 s:
 // and decoding goes on, instead of the queue being marked stuck for good.
 static uint64_t gVcnForced, gVcnLostSeq;
 static uint32_t gVcnLostFence, gVcnLostFences, gVcnLostAgeMs;
+static uint32_t gVcnMaxPendMs;   // the longest a VCN submission was seen unfinished
 // debug.phx_faultdef (default 1): when the gfx queue is adopted, the GFX hub gets what Linux gives it
 // (gfxhub_v3_0_3_init_system_aperture_regs + set_fault_enable_default): a wired, zeroed 4 KiB system page as
 // GCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR and the eleven *_ENABLE_DEFAULT bits. The bring-up leaves FAULT_CNTL at 0x2:
@@ -282,7 +283,10 @@ public:
     IOReturn vmMap(uint32_t vmid, uint64_t va, IOMemoryDescriptor *md, uint64_t off, uint64_t size);
     IOReturn vmUnmap(uint32_t vmid, uint64_t va, uint64_t size);
     IOReturn gpuSubmit(uint32_t vmid, bool gfx, const uint64_t *ibVa, const uint32_t *ibDw, uint32_t n, uint64_t *seq);
-    uint64_t gpuRetired() const;
+    uint64_t gpuRetired() const { return gpuRetiredMask(7); }
+    // the same over a subset of the queues (bit 0 compute, 1 gfx, 2 VCN): a client waits only on queues it used, so
+    // a slow video job no longer holds WindowServer's waits back
+    uint64_t gpuRetiredMask(uint32_t qmask) const;
     void faultDefaultOn();
     int gcFaultStat(char *b, size_t n);
     int vmWalk(char *b, size_t n);
@@ -499,6 +503,7 @@ private:
     bool sessionClaimed{false};
     uint32_t vmid{0};        // this client's GPUVM context, taken on its first GPU mapping or submission
     uint64_t lastSeq{0};     // its newest submission: the context is released only once the GPU is past it
+    uint32_t qUsed{0};       // queues it has submitted to (gpuRetiredMask bits): its waits look at these only
     bool ensureVmid() { return vmid || (vmid = owner->vmidAlloc()) != 0; }
     Bo *bos{nullptr};      // PHXN_MAX_BOS entries, index = handle
     Map *maps{nullptr};    // kMaxMaps entries
@@ -1188,12 +1193,13 @@ uint64_t PhxBringup::queueFence(const GpuQueue &q) const {
 
 // Everything up to the returned sequence has finished: the oldest submission still running on any queue, minus one.
 // Lock-free reader: an entry is written before `tail` moves past it.
-uint64_t PhxBringup::gpuRetired() const {
+uint64_t PhxBringup::gpuRetiredMask(uint32_t qmask) const {
     if (suspended)
         return retiredAtSleep;   // the fences are in VRAM, which is gone until the queues are adopted again
     uint64_t r = gSeq;
-    for (const GpuQueue &q : gq) {
-        if (!q.ready)
+    for (uint32_t qi = 0; qi < 3; qi++) {
+        const GpuQueue &q = gq[qi];
+        if (!q.ready || !(qmask & (1u << qi)))
             continue;
         const uint64_t done = queueFence(q);
         const uint32_t tail = q.tail;
@@ -1218,7 +1224,9 @@ uint64_t PhxBringup::gpuRetired() const {
                 // a hung VCN must not stall the GFX waits: past 2 s the entry stops counting
                 if (gVcnStuck)
                     break;
-                if (ns > 2000000000ull) {
+                if (ns / 1000000 > gVcnMaxPendMs)
+                    gVcnMaxPendMs = static_cast<uint32_t>(ns / 1000000);
+                if (ns > 10000000000ull) {   // 10 s (waits are per client now, so this holds back the video client only)
                     if (OSCompareAndSwap(0, 1, reinterpret_cast<volatile UInt32 *>(&gVcnStuck)))
                         OSIncrementAtomic(&gVcnStuckCount);
                     break;
@@ -1524,10 +1532,10 @@ int PhxBringup::vcnCtl(int v) {
 int PhxBringup::vcnStat(char *b, size_t n) {
     const bool up = vcnPowered();   // registers of an unpowered VCN read 0xffffffff; do not touch them then
     const volatile uint32_t *fence = fbAper && gq[2].ready ? reinterpret_cast<const volatile uint32_t *>(fbAper->getVirtualAddress() + gq[2].fenceOff) : nullptr;
-    return snprintf(b, n, "vcn %d stuck %d (times %d) queue %d; wptr 0x%x; tests ok %u fail %u last %u us; last err %u; submits %lld; lost fences %u (last: seq 0x%llx fence 0x%x after %u ms); UVD_POWER_STATUS 0x%08x UVD_STATUS 0x%08x RB_ENABLE 0x%08x RB_BASE 0x%x_%08x RB_SIZE 0x%x RPTR 0x%x WPTR 0x%x; fence 0x%x seq 0x%llx",
+    return snprintf(b, n, "vcn %d stuck %d (times %d) queue %d; wptr 0x%x; tests ok %u fail %u last %u us; last err %u; submits %lld; lost fences %u (last: seq 0x%llx fence 0x%x after %u ms); longest pending %u ms; UVD_POWER_STATUS 0x%08x UVD_STATUS 0x%08x RB_ENABLE 0x%08x RB_BASE 0x%x_%08x RB_SIZE 0x%x RPTR 0x%x WPTR 0x%x; fence 0x%x seq 0x%llx",
                     gVcnOn, (int)gVcnStuck, (int)gVcnStuckCount, gq[2].ready ? 1 : 0, gVcnWptr, gVcnTestsOk, gVcnTestsFail, gVcnLastUs, gVcnLastErr,
                     (long long)gVcnSubmits, gVcnLostFences, (unsigned long long)gVcnLostSeq, gVcnLostFence, gVcnLostAgeMs,
-                    mmio ? rreg(kVcnPowerStatus) : 0, up ? rreg(kVcnStatus) : 0, up ? rreg(kVcnRbEnable) : 0,
+                    gVcnMaxPendMs, mmio ? rreg(kVcnPowerStatus) : 0, up ? rreg(kVcnStatus) : 0, up ? rreg(kVcnRbEnable) : 0,
                     up ? rreg(kVcnRbBaseHi) : 0, up ? rreg(kVcnRbBaseLo) : 0, up ? rreg(kVcnRbSize) : 0,
                     up ? rreg(kVcnRbRptr) : 0, up ? rreg(kVcnRbWptr) : 0, fence ? fence[0] : 0, (unsigned long long)gSeq);
 }
@@ -1646,6 +1654,11 @@ int PhxBringup::mmvmStat(char *b, size_t n) {
 }
 
 bool PhxBringup::vcnSubmitReady() const {
+    if (gVcnStuck && gq[2].ready) {   // the slow job did finish: the queue is usable again
+        const GpuQueue &q = gq[2];
+        if (q.head == q.tail || queueFence(q) >= q.fseq[(q.tail - 1) & 63])
+            gVcnStuck = 0;
+    }
     return gq[2].ready && !gVcnStuck && gMmvmOn && !gMmvmBad && !suspended;
 }
 
@@ -3024,6 +3037,7 @@ IOReturn IOAccelPhxNativeClient::doSubmit(IOExternalMethodArguments *a) {
                                : owner->gpuSubmit(vmid, ib0.ip_type == PHX_AMDGPU_HW_IP_GFX, va, dw, h.num_ibs, &seq);
         if (r != kIOReturnSuccess)
             return r;
+        qUsed |= ib0.ip_type == PHX_AMDGPU_HW_IP_VCN_ENC ? 4u : 3u;   // gfx and compute IBs may share a queue
         lastSeq = seq;
         emitted = seq;   // externalMethod already holds `lock`
         if (fb) {
@@ -3330,7 +3344,8 @@ IOReturn IOAccelPhxNativeClient::doWaitSeq(IOExternalMethodArguments *a) {
         uint64_t timeout = a->scalarInput[1];
         if (timeout > PHXN_WAIT_CAP_NS)
             timeout = PHXN_WAIT_CAP_NS;
-        uint64_t retired = owner->gpuRetired();
+        const uint32_t qm = qUsed ? qUsed : 7u;
+        uint64_t retired = owner->gpuRetiredMask(qm);
         for (uint64_t waited = 0; retired < target && waited < timeout; ) {
             if (waited < 1000000ull) {
                 // Short wait (< 1 ms): fast poll with 50 us delay for low latency
@@ -3341,7 +3356,7 @@ IOReturn IOAccelPhxNativeClient::doWaitSeq(IOExternalMethodArguments *a) {
                 IOSleep(1);
                 waited += 1000000ull;
             }
-            retired = owner->gpuRetired();
+            retired = owner->gpuRetiredMask(qm);
         }
         if (retired >= target) {
             // drop CPU cache lines so the CPU sees what the GPU wrote; under the lock, as another thread of the same
