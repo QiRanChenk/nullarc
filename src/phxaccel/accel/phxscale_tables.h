@@ -1,5 +1,5 @@
 // Generated from Linux amdgpu's DCN 3.1.4 programming of plane scaling on this panel (staging/scaler: Linux 7.x,
-// atomic SRC 2880x1800 / 3360x2100 / 3840x2400 -> CRTC 2560x1600). Register numbers are dword offsets in BAR5.
+// atomic SRC 2880x1800 / 3840x2400 -> CRTC 2560x1600). Register numbers are dword offsets in BAR5.
 #pragma once
 #include <stdint.h>
 struct PhxRegVal { uint16_t reg; uint32_t val; };
@@ -30,35 +30,6 @@ static const PhxRegVal kScale2880[] = {
     { 0x3aac, 0x07080b40 },   // HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION_C
     { 0x3aab, 0x00000000 },   // HUBP0_DCSURF_PRI_VIEWPORT_START_C
     { 0x3ab0, 0x07080b40 },   // HUBP0_DCSURF_SEC_VIEWPORT_DIMENSION_C
-    { 0x3aaf, 0x00000000 },   // HUBP0_DCSURF_SEC_VIEWPORT_START_C
-};
-// 3360: DSCL0 + HUBP0 viewport, in Linux's order (SCL_MODE, coefficient RAM, pitch and address are written apart)
-static const PhxRegVal kScale3360[] = {
-    { 0x41d7, 0x00000000 },   // DSCL0_DSCL_MEM_PWR_CTRL
-    { 0x41cc, 0x00000000 },   // DSCL0_DSCL_AUTOCAL
-    { 0x41bd, 0x00000000 },   // DSCL0_DSCL_CONTROL
-    { 0x41d1, 0x00000000 },   // DSCL0_RECOUT_START
-    { 0x41d2, 0x06400a00 },   // DSCL0_RECOUT_SIZE
-    { 0x41d3, 0x06400a00 },   // DSCL0_MPC_SIZE
-    { 0x41d4, 0x00000000 },   // DSCL0_LB_DATA_FORMAT
-    { 0x41d5, 0x00003f00 },   // DSCL0_LB_MEMORY_CTRL
-    { 0x41c0, 0x01500000 },   // DSCL0_SCL_HORZ_FILTER_SCALE_RATIO
-    { 0x41c4, 0x01500000 },   // DSCL0_SCL_VERT_FILTER_SCALE_RATIO
-    { 0x41c2, 0x01500000 },   // DSCL0_SCL_HORZ_FILTER_SCALE_RATIO_C
-    { 0x41c7, 0x01500000 },   // DSCL0_SCL_VERT_FILTER_SCALE_RATIO_C
-    { 0x41c1, 0x03280000 },   // DSCL0_SCL_HORZ_FILTER_INIT
-    { 0x41c3, 0x03280000 },   // DSCL0_SCL_HORZ_FILTER_INIT_C
-    { 0x41c5, 0x02a80000 },   // DSCL0_SCL_VERT_FILTER_INIT
-    { 0x41c8, 0x02a80000 },   // DSCL0_SCL_VERT_FILTER_INIT_C
-    { 0x41bc, 0x00003232 },   // DSCL0_SCL_TAP_CONTROL
-    { 0x41be, 0x00000000 },   // DSCL0_DSCL_2TAP_CONTROL
-    { 0x3aaa, 0x08340d20 },   // HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION
-    { 0x3aa9, 0x00000000 },   // HUBP0_DCSURF_PRI_VIEWPORT_START
-    { 0x3aae, 0x08340d20 },   // HUBP0_DCSURF_SEC_VIEWPORT_DIMENSION
-    { 0x3aad, 0x00000000 },   // HUBP0_DCSURF_SEC_VIEWPORT_START
-    { 0x3aac, 0x08340d20 },   // HUBP0_DCSURF_PRI_VIEWPORT_DIMENSION_C
-    { 0x3aab, 0x00000000 },   // HUBP0_DCSURF_PRI_VIEWPORT_START_C
-    { 0x3ab0, 0x08340d20 },   // HUBP0_DCSURF_SEC_VIEWPORT_DIMENSION_C
     { 0x3aaf, 0x00000000 },   // HUBP0_DCSURF_SEC_VIEWPORT_START_C
 };
 // 3840: DSCL0 + HUBP0 viewport, in Linux's order (SCL_MODE, coefficient RAM, pitch and address are written apart)

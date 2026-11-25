@@ -568,14 +568,16 @@ public:
     }
     IODeviceMemory *getVRAMRange() override { return getApertureRange(kIOFBSystemAperture); }
     const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
-    // Scaled modes: the panel also offers rasters larger than its own (2880x1800, 3360x2100, 3840x2400), which macOS
-    // halves into the HiDPI looks 1440x900, 1680x1050 and 1920x1200. WindowServer's frames are copied into a buffer of
+    // Scaled modes: the panel also offers rasters larger than its own (2880x1800, 3840x2400), which macOS halves into
+    // the HiDPI looks 1440x900 and 1920x1200. (3360x2100 / 1680x1050 is gone: HUBP wants the pitch in 64-pixel steps,
+    // 3360 is not one, and the owner did not want the mode.) WindowServer's frames are copied into a buffer of
     // that size in an unused part of the carve-out (kXOff), and the display pipe's scaler (DPP0 DSCL, 4-tap filter)
     // shrinks it to the panel: HUBP0 scans the buffer with a viewport of the raster, DSCL0 takes it to 2560x1600. The
     // register values are Linux amdgpu's for the same plane scaling on this machine (phxscale_tables.h). The firmware
     // runs HUBP0 with TTU off, so none of Linux's DLG/TTU/watermark values apply; only the scaler and the surface change.
     // -phxscaleoff: native only.
-    static constexpr uint32_t kXW[3] = { 2880, 3360, 3840 }, kXH[3] = { 1800, 2100, 2400 };
+    static constexpr uint32_t kXW[2] = { 2880, 3840 }, kXH[2] = { 1800, 2400 };
+    static_assert(kXW[0] % 64 == 0 && kXW[1] % 64 == 0, "HUBP0 pitch is taken as the width: it must be a multiple of 64 pixels");
     // VRAM 256 MiB..+36 MiB: past the BAR (the firmware areas, the external heads and the GOP's DMUB windows all sit
     // below 0x0e000000) and far below the DMUB mailbox at the top of the 512 MiB carve-out (0x1fe00000).
     static constexpr uint64_t kXOff = 0x10000000ull, kXBytes = 0x2400000ull;
@@ -588,14 +590,15 @@ public:
     // native values of everything a scaled mode writes, read before the first switch away from native
     enum { kXSaveMax = 40 };
     PhxRegVal fXSave[kXSaveMax] = {}; unsigned fXSaveN = 0;
-    int xmode(IODisplayModeID m) const { return (fXModes && m >= 2 && m <= 4) ? (int)m - 2 : -1; }
+    // mode IDs 2 (2880x1800) and 4 (3840x2400), as before 3 was dropped, so a saved 1920x1200 choice still finds its mode
+    int xmode(IODisplayModeID m) const { return !fXModes ? -1 : m == 2 ? 0 : m == 4 ? 1 : -1; }
+    static IODisplayModeID xModeID(int x) { return x == 0 ? 2 : 4; }
     uint32_t curW() const { return fXCur >= 0 ? kXW[fXCur] : fWidth; }
     uint32_t curH() const { return fXCur >= 0 ? kXH[fXCur] : fHeight; }
     uint32_t curRow() const { return fXCur >= 0 ? kXW[fXCur] * 4 : fRowBytes; }
     static const PhxRegVal *xTable(int x, unsigned *n) {
         switch (x) {
         case 0: *n = sizeof kScale2880 / sizeof kScale2880[0]; return kScale2880;
-        case 1: *n = sizeof kScale3360 / sizeof kScale3360[0]; return kScale3360;
         default: *n = sizeof kScale3840 / sizeof kScale3840[0]; return kScale3840;
         }
     }
@@ -635,8 +638,8 @@ public:
             r[kSclMode] = 1u | cur << 8;
             unsigned n; const PhxRegVal *t = xTable(x, &n);
             for (unsigned i = 0; i < n; i++) r[t[i].reg] = t[i].val;
-            const PhxRegVal *c = x == 2 ? kCoef149 : kCoef116;
-            const unsigned cn = x == 2 ? sizeof kCoef149 / sizeof kCoef149[0] : sizeof kCoef116 / sizeof kCoef116[0];
+            const PhxRegVal *c = x == 1 ? kCoef149 : kCoef116;
+            const unsigned cn = x == 1 ? sizeof kCoef149 / sizeof kCoef149[0] : sizeof kCoef116 / sizeof kCoef116[0];
             for (unsigned i = 0; i < cn; i++) r[c[i].reg] = c[i].val;
             r[kSclMode] = 1u | (cur ^ 1u) << 8;
             r[kPitch] = kXW[x] - 1;
@@ -697,9 +700,9 @@ public:
         IOLockUnlock(fXLock);
         return ret;
     }
-    IOItemCount getDisplayModeCount() override { return fXModes ? 4 : 1; }
+    IOItemCount getDisplayModeCount() override { return fXModes ? 3 : 1; }
     IOReturn getDisplayModes(IODisplayModeID *modes) override {
-        modes[0] = fModeID; if (fXModes) for (int i = 0; i < 3; i++) modes[1 + i] = 2 + i;
+        modes[0] = fModeID; if (fXModes) for (int i = 0; i < 2; i++) modes[1 + i] = xModeID(i);
         return kIOReturnSuccess; }
     IOReturn getInformationForDisplayMode(IODisplayModeID mode, IODisplayModeInformation *info) override {
         if (!info) return kIOReturnBadArgument;
@@ -733,7 +736,7 @@ public:
         return kIOReturnSuccess;
     }
     IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override {
-        *mode = fXCur >= 0 ? 2 + fXCur : fModeID; *depth = 0; return kIOReturnSuccess; }
+        *mode = fXCur >= 0 ? xModeID(fXCur) : fModeID; *depth = 0; return kIOReturnSuccess; }
     IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = fModeID; *depth = 0; return kIOReturnSuccess; }
     IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override {
         if (depth != 0) return kIOReturnUnsupported;
