@@ -648,6 +648,12 @@ public:
         }
         r[kOtg0Lock] = 0;
     }
+    // opaque black over the raster of mode x, with non-temporal stores like the frame copies
+    void xClear(int x) {
+        uint64_t *px = (uint64_t *)fXMap->getVirtualAddress();
+        for (uint64_t i = 0, n = (uint64_t)kXW[x] * kXH[x] / 2; i < n; i++) __builtin_nontemporal_store(0xff000000ff000000ull, &px[i]);
+        __asm__ __volatile__("sfence" ::: "memory");
+    }
     // Something put the firmware's native scan-out back under a scaled mode (a hibernation, the firmware on a wake):
     // the panel would freeze on the old frame at VRAM 0. Called from the VBL timer every 16 ticks, and before the
     // backlight comes back on (a wake: the firmware's native scan-out showed for about a second, 2026-11-25).
@@ -657,6 +663,9 @@ public:
         if (fXCur >= 0 && (r[kAddr] != (uint32_t)fXMc || r[0x3aaa] != (kXH[fXCur] << 16 | kXW[fXCur]))) {
             PFBLOG("scale: pipe 0 lost the %ux%u setup (address 0x%x, viewport 0x%x): programming it again",
                    kXW[fXCur], kXH[fXCur], r[kAddr], r[0x3aaa]);
+            // After a hibernation the carve-out holds whatever the firmware left there, not our last frame (the panel
+            // showed garbage until WindowServer drew again, 2026-11-25): black until then.
+            if (fXMap) xClear(fXCur);
             xProgram(fXCur);
         }
         IOLockUnlock(fXLock);
@@ -686,10 +695,7 @@ public:
             volatile uint32_t *r = (volatile uint32_t *)fMmio->getVirtualAddress();
             if (x >= 0) {
                 if (fXCur < 0) xSave(r);
-                // black (opaque) until WindowServer's first frame of the new size; non-temporal like the frame copies
-                uint64_t *px = (uint64_t *)fXMap->getVirtualAddress();
-                for (uint64_t i = 0, n = (uint64_t)kXW[x] * kXH[x] / 2; i < n; i++) __builtin_nontemporal_store(0xff000000ff000000ull, &px[i]);
-                __asm__ __volatile__("sfence" ::: "memory");
+                xClear(x);   // black until WindowServer's first frame of the new size
             }
             const int was = fXCur;
             fXCur = x;
