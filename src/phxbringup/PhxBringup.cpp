@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 37u
+#define PHX_KEXT_BUILD 38u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -47,6 +47,44 @@ SYSCTL_INT(_debug, OID_AUTO, phx_hang_ms, CTLFLAG_RW | CTLFLAG_LOCKED, &gHangMs,
            "ms without progress before a hung submission's waves are killed (0 off)");
 SYSCTL_INT(_debug, OID_AUTO, phx_hang_kills, CTLFLAG_RD | CTLFLAG_LOCKED, (int *)&gHangKills, 0,
            "hung submissions whose waves were killed");
+// VCN 4.0.2 (video decode). debug.phxvcn=1 adopts the VCN0 unified ring a user-space bring-up left running (ring and
+// fence in VRAM: the fence page follows the 4 KiB ring), 2 runs a ring test from the kext, 0 forgets the ring.
+// debug.phxmmvm=1 turns MMHUB VM translation on with the values Linux programs on this chip (the firmware leaves MMHUB
+// physical-only, MX_L1_TLB_CNTL 0x501), so that VCN can reach a client's virtual addresses: contexts 8..15 get the same
+// page-table roots as the GC hub when vmBind lends a VMID. 0 puts the firmware values back. Ported from Vermilion's
+// phx_vcn_mmhub.cpp (MIT); MMHUB 3.0.1 has the register offsets of MMHUB 3.0.0, VCN 4.0.2 those of VCN 4.0.0.
+class PhxBringup;
+static PhxBringup *gPhx;
+static constexpr uint32_t kVcnPowerStatus = 0x7e02, kVcnStatus = 0x7f43, kVcnRbBaseLo = 0x7eea, kVcnRbBaseHi = 0x7eeb,
+                          kVcnRbSize = 0x7eec, kVcnRbEnable = 0x7e85, kVcnRbRptr = 0x7eac, kVcnRbWptr = 0x7ead;
+static constexpr uint32_t kVcnRingDw = 0x400;
+static constexpr uint32_t kMmL2Cntl = 0x1A700, kMmL2Cntl2 = 0x1A701, kMmL2Cntl3 = 0x1A702, kMmL2Status = 0x1A703,
+                          kMmFaultCntl2 = 0x1A709, kMmFaultStatus = 0x1A70C, kMmFaultAddrLo = 0x1A70D, kMmFaultAddrHi = 0x1A70E,
+                          kMmFaultDefLo = 0x1A70F, kMmFaultDefHi = 0x1A710, kMmIdApLowLo = 0x1A712, kMmL2Cntl4 = 0x1A718,
+                          kMmBankSel = 0x1A71B, kMmL2Cntl5 = 0x1A71E, kMmCtx0Cntl = 0x1A740, kMmEng0Sem = 0x1A751,
+                          kMmEng17Sem = 0x1A762, kMmEng17Req = 0x1A774, kMmEng17Ack = 0x1A786, kMmEng0RangeLo = 0x1A787,
+                          kMmCtx0BaseLo = 0x1A7AB, kMmCtx0StartLo = 0x1A7CB, kMmCtx0EndLo = 0x1A7EB, kMmSysapDefLsb = 0x1A8D8,
+                          kMmSysapDefMsb = 0x1A8D9, kMmMxL1TlbCntl = 0x1A8F3;
+static int gVcnOn = 0, gMmvmOn = 0;
+static uint32_t gVcnWptr, gVcnTestsOk, gVcnTestsFail, gVcnLastUs, gVcnLastErr;
+static IOLock *gVcnLock;
+static uint32_t gMmvmSaved[10], gMmvmBad, gMmvmFlushTimeouts, gMmvmFlushMaxUs, gMmvmFlushes;
+static IOBufferMemoryDescriptor *gMmDummy;
+static volatile SInt64 gVcnSubmits;
+static uint64_t gVcnSubAbs[64];                     // when each VCN ring entry was queued
+static volatile SInt32 gVcnStuck, gVcnStuckCount;   // a VCN job older than 2 s: it stops holding the GFX waits back
+static int phxVcnSysctl SYSCTL_HANDLER_ARGS;
+static int phxVcnStatSysctl SYSCTL_HANDLER_ARGS;
+static int phxMmvmSysctl SYSCTL_HANDLER_ARGS;
+static int phxMmvmStatSysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, phxvcn, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, phxVcnSysctl, "I",
+            "1 adopts the VCN0 ring a user-space bring-up left running, 2 runs a ring test, 0 forgets it");
+SYSCTL_PROC(_debug, OID_AUTO, phxvcn_stat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, phxVcnStatSysctl, "A",
+            "VCN0 ring state");
+SYSCTL_PROC(_debug, OID_AUTO, phxmmvm, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, nullptr, 0, phxMmvmSysctl, "I",
+            "1 turns MMHUB VM translation on for VCN, 0 restores the firmware's physical-only mode");
+SYSCTL_PROC(_debug, OID_AUTO, phxmmvm_stat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, phxMmvmStatSysctl, "A",
+            "MMHUB VM state (never reads the semaphore registers)");
 // debug.phx_pm_*: SMU 13.0.4 power management. Every phx_pm_ms the SMU copies its metrics table (SmuMetrics_t) into
 // one VRAM page (Linux smu_cmn_update_table) and the values below are refreshed. phx_pm_mode picks the GFX clock policy:
 // 0 = leave the PMFW defaults (telemetry only), 1 = auto (Linux AMD_DPM_FORCED_LEVEL_AUTO: HardMin = min, SoftMax = max,
@@ -206,6 +244,13 @@ public:
     IOReturn vmUnmap(uint32_t vmid, uint64_t va, uint64_t size);
     IOReturn gpuSubmit(uint32_t vmid, bool gfx, const uint64_t *ibVa, const uint32_t *ibDw, uint32_t n, uint64_t *seq);
     uint64_t gpuRetired() const;
+    int vcnCtl(int v);
+    int vcnStat(char *b, size_t n);
+    int mmvmCtl(int v);
+    int mmvmStat(char *b, size_t n);
+    IOReturn gpuSubmitVcn(uint32_t vmid, const uint64_t *ibVa, const uint32_t *ibDw, uint32_t n, uint64_t *seq);
+    bool vcnSubmitReady() const;
+    bool vcnPowered() const { return mmio && rreg(kVcnPowerStatus) != 0xFFFFFFFFu; }
     const phx_topology *capturedTopology() const { return topology; }
     IOReturn setPowerState(unsigned long ordinal, IOService *whichDevice) override;
 
@@ -216,6 +261,8 @@ private:
     bool pspWaitTos(uint32_t timeoutMs) const;
     IOReturn pspRunCmd(uint32_t cmdId, const uint32_t *unionWords, uint32_t nWords, uint64_t out[4]);
     void hdpFlush() const;
+    void mmhubFlush(uint32_t vmid) const;
+    void vcnForget();
     void readFbLayout();
     void clearRing();
 
@@ -255,7 +302,7 @@ private:
     // the queues; each queue's fence holds the last sequence it finished, and fseq/fend keep its outstanding
     // submissions in order (sequence, ring position after it).
     struct GpuQueue {
-        bool ready, gfx;
+        bool ready, gfx, vcn;
         uint32_t ringOff, ringDw, wbOff, fenceOff;
         uint64_t dbByte, wptr, doneEnd;
         uint64_t fseq[64], fend[64];
@@ -264,7 +311,7 @@ private:
         uint64_t lastDone, lastProgress;        // the hang watchdog's view: fence seen last, and when it last moved
         uint64_t killedSeq; bool killedAll;
     };
-    GpuQueue gq[2]{};
+    GpuQueue gq[3]{};   // compute, gfx, VCN0 (unified ring)
     uint64_t gSeq{0};
     uint64_t queueFence(const GpuQueue &q) const;
     IOLock *gpuLock{nullptr};
@@ -525,10 +572,15 @@ void PhxBringup::stop(IOService *provider) {
         }
     }
     if (gSysctlUp) {
+        gPhx = nullptr;
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush);
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_unregister_oid(&sysctl__debug_phxvcn);
+        sysctl_unregister_oid(&sysctl__debug_phxvcn_stat);
+        sysctl_unregister_oid(&sysctl__debug_phxmmvm);
+        sysctl_unregister_oid(&sysctl__debug_phxmmvm_stat);
         for (struct sysctl_oid *o : kPmOids)
             sysctl_unregister_oid(o);
         gSysctlUp = 0;
@@ -542,7 +594,7 @@ void PhxBringup::stop(IOService *provider) {
         sysBuf->release();
         sysBuf = nullptr;
     }
-    gq[0].ready = gq[1].ready = false;
+    gq[0].ready = gq[1].ready = gq[2].ready = false;
     for (VmCtx &c : vm) {
         for (IOBufferMemoryDescriptor *b : c.chunk)
             if (b)
@@ -595,6 +647,7 @@ IOReturn PhxBringup::setPowerState(unsigned long ordinal, IOService *whichDevice
                 IOSleep(1);
             IOLockLock(gpuLock);
             retiredAtSleep = gpuRetired();
+            vcnForget();   // VCN loses power with the rest; the bring-up has to start it again after the wake
             suspended = true;
             IOLockUnlock(gpuLock);
             IOLog("PhxBringup: sleep: submissions held at seq %llu (emitted %llu)\n",
@@ -810,6 +863,29 @@ void PhxBringup::vmFlushTlb(uint32_t vmid) const {
     wreg(kRegInvEng17Req, 0x00F80000u | (1u << vmid) | 1u);
     for (int i = 0; i < 1000 && !(rreg(kRegInvEng17Ack) & (1u << vmid)); i++)
         IODelay(1);
+    if (gMmvmOn)
+        mmhubFlush(vmid);
+}
+
+// gmc_v11_0_flush_gpu_tlb on MMHUB (engine 17, with its semaphore: a read that returns 1 takes it)
+void PhxBringup::mmhubFlush(uint32_t vmid) const {
+    uint32_t us = 0;
+    while (!(rreg(kMmEng17Sem) & 1)) {
+        if (++us > 100000) { gMmvmFlushTimeouts++; return; }
+        IODelay(1);
+    }
+    wreg(kMmEng17Req, 0x00F80000u | (1u << vmid));
+    uint32_t t = 0;
+    while (!(rreg(kMmEng17Ack) & (1u << vmid))) {
+        if (++t > 100000) { gMmvmFlushTimeouts++; break; }
+        IODelay(1);
+    }
+    wreg(kMmEng17Sem, 0);
+    wreg(kMmBankSel, rreg(kMmBankSel) | 1u << 25);
+    (void)rreg(kMmBankSel);
+    gMmvmFlushes++;
+    if (t > gMmvmFlushMaxUs)
+        gMmvmFlushMaxUs = t;
 }
 
 // Takes a free context: empty tables (root only), no hardware VMID until its first submission. Returns its handle,
@@ -883,6 +959,15 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     wreg(kRegCtx0StartLo + 2 * vmid + 1, 0);
     wreg(kRegCtx0EndLo + 2 * vmid, 0xffffffff);
     wreg(kRegCtx0EndLo + 2 * vmid + 1, 0xf);
+    if (gMmvmOn) {   // the same tables for VCN on MMHUB
+        wreg(kMmCtx0BaseLo + 2 * vmid, static_cast<uint32_t>(c.phys | 1));
+        wreg(kMmCtx0BaseLo + 2 * vmid + 1, static_cast<uint32_t>(c.phys >> 32));
+        wreg(kMmCtx0StartLo + 2 * vmid, 0);
+        wreg(kMmCtx0StartLo + 2 * vmid + 1, 0);
+        wreg(kMmCtx0EndLo + 2 * vmid, 0xffffffff);
+        wreg(kMmCtx0EndLo + 2 * vmid + 1, 0xf);
+        wreg(kMmCtx0Cntl + vmid, 0x01fffe07);
+    }
     vmFlushTlb(vmid);
     return vmid;
 }
@@ -932,6 +1017,7 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
     // the next submission of each context programs its VMID again (vmBind) instead of running on an unmapped one.
     if (qi == 0) {
         gfxPgOn = false; gfxOffAllowed = false;   // a fresh bring-up: RLC power gating and the PMFW's allow are gone
+        vcnForget();                              // and so are VCN and the MMHUB translation setup
         uint32_t n = 0;
         for (uint32_t i = 0; i < kMaxCtx; i++)
             if (vm[i].hw) { vm[i].hw = 0; n++; }
@@ -1022,6 +1108,13 @@ void PhxBringup::ringPut(GpuQueue &q, uint32_t idx, uint32_t value) {
 
 uint64_t PhxBringup::queueFence(const GpuQueue &q) const {
     const volatile uint32_t *f = reinterpret_cast<const volatile uint32_t *>(fbAper->getVirtualAddress() + q.fenceOff);
+    if (q.vcn) {   // VCN_ENC_CMD_FENCE writes the low 32 bits of the sequence only
+        const uint64_t cur = gSeq;
+        uint64_t v = (cur & ~0xFFFFFFFFull) | f[0];
+        if (v > cur)
+            v -= 1ull << 32;
+        return v;
+    }
     return static_cast<uint64_t>(f[0]) | (static_cast<uint64_t>(f[1]) << 32);
 }
 
@@ -1037,6 +1130,18 @@ uint64_t PhxBringup::gpuRetired() const {
         const uint64_t done = queueFence(q);
         const uint32_t tail = q.tail;
         for (uint32_t i = q.head; i != tail; i++) {
+            if (q.fseq[i & 63] > done && q.vcn) {
+                // a hung VCN must not stall the GFX waits: past 2 s the entry stops counting
+                if (gVcnStuck)
+                    break;
+                uint64_t ns;
+                absolutetime_to_nanoseconds(mach_absolute_time() - gVcnSubAbs[i & 63], &ns);
+                if (ns > 2000000000ull) {
+                    if (OSCompareAndSwap(0, 1, reinterpret_cast<volatile UInt32 *>(&gVcnStuck)))
+                        OSIncrementAtomic(&gVcnStuckCount);
+                    break;
+                }
+            }
             if (q.fseq[i & 63] > done) {
                 if (q.fseq[i & 63] - 1 < r)
                     r = q.fseq[i & 63] - 1;
@@ -1128,6 +1233,336 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     return kIOReturnSuccess;
 }
 
+// --- VCN 4.0.2 unified ring and MMHUB VM translation (ported from Vermilion's phx_vcn_mmhub.cpp, MIT) ---------------
+
+static uint64_t phxNowNs() {
+    uint64_t ns;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+    return ns;
+}
+
+// gpuLock held (or no submitter left): the hardware state behind the VCN queue and the MMHUB setup is gone
+void PhxBringup::vcnForget() {
+    gq[2].ready = false;
+    gVcnOn = 0;
+    gMmvmOn = 0;
+    gVcnStuck = 0;
+}
+
+int PhxBringup::vcnCtl(int v) {
+    if (!mmio || !fbAper || !fbMcBase)
+        return ENXIO;
+    if (!gVcnLock && !(gVcnLock = IOLockAlloc()))
+        return ENOMEM;
+    IOLockLock(gVcnLock);
+    int r = 0;
+    if (v == 0) {
+        if (gpuLock && gq[2].ready) {
+            IOLockLock(gpuLock);
+            const bool idle = gVcnStuck || queueFence(gq[2]) >= (gq[2].head != gq[2].tail ? gq[2].fseq[(gq[2].tail - 1) & 63] : 0);
+            if (idle && !gMmvmOn)
+                gq[2].ready = false;
+            else
+                r = EBUSY;   // pending VCN work or MMHUB VM still on
+            IOLockUnlock(gpuLock);
+        }
+        if (!r)
+            gVcnOn = 0;
+    } else if (v == 1) {
+        const uint32_t ps = rreg(kVcnPowerStatus);
+        if (ps == 0xFFFFFFFFu || (ps & 3) != 1) {
+            gVcnLastErr = 1; r = ENODEV;   // VCN0 not powered up (no bring-up in this boot)
+        } else {
+            const uint64_t mc = static_cast<uint64_t>(rreg(kVcnRbBaseLo)) | (static_cast<uint64_t>(rreg(kVcnRbBaseHi)) << 32);
+            const uint32_t rp = rreg(kVcnRbRptr), wp = rreg(kVcnRbWptr);
+            const uint64_t off = mc - fbMcBase;
+            // the ring must be 4 KiB of VRAM the CPU reaches through BAR0, with the fence page right behind it
+            if (mc < fbMcBase || (off & 0xFFF) || off + 0x2000 > fbAperLen || rreg(kVcnRbSize) != kVcnRingDw ||
+                (rreg(kVcnRbEnable) & 1) == 0) {
+                gVcnLastErr = 2; r = EINVAL;
+            } else if (rp != wp || (wp & 63) || wp >= kVcnRingDw) {
+                gVcnLastErr = 3; r = EBUSY;    // not idle
+            } else if (!gpuLock) {
+                r = ENXIO;
+            } else {
+                IOLockLock(gpuLock);   // the ring is the third queue on the global sequence
+                GpuQueue &q = gq[2];
+                bzero(&q, sizeof(q));
+                q.vcn = true;
+                q.ringOff = static_cast<uint32_t>(off);
+                q.ringDw = kVcnRingDw;
+                q.fenceOff = static_cast<uint32_t>(off + 0x1000);
+                q.wptr = q.doneEnd = wp;
+                gVcnStuck = 0;
+                *reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + q.fenceOff) = static_cast<uint32_t>(gSeq);
+                __asm__ __volatile__("sfence" ::: "memory");
+                hdpFlush();
+                q.ready = true;
+                IOLockUnlock(gpuLock);
+                gVcnWptr = wp;
+                gVcnOn = 1;
+                gVcnLastErr = 0;
+                IOLog("PhxBringup: adopted VCN0 ring=+0x%llx wptr=0x%x\n", off, wp);
+            }
+        }
+    } else if (v == 2) {
+        if (!gVcnOn || !gq[2].ready || queueFence(gq[2]) < (gq[2].head != gq[2].tail ? gq[2].fseq[(gq[2].tail - 1) & 63] : 0)) {
+            r = gVcnOn ? EBUSY : EINVAL;
+        } else {
+            IOLockLock(gpuLock);
+            GpuQueue &q = gq[2];
+            for (uint32_t i = 0; i < 64; i++)
+                ringPut(q, i, i ? 0u : 0x00000001u);   // VCN_ENC_CMD_END + 63 VCN_ENC_CMD_NO_OP
+            q.wptr += 64;
+            q.doneEnd = q.wptr;   // nothing to retire: a ring test carries no fence
+            const uint32_t nw = static_cast<uint32_t>(q.wptr & (kVcnRingDw - 1));
+            __asm__ __volatile__("sfence" ::: "memory");
+            hdpFlush();
+            const uint64_t t0 = phxNowNs();
+            wreg(kVcnRbWptr, nw);
+            uint32_t rp = 0;
+            for (int i = 0; i < 2000 && (rp = rreg(kVcnRbRptr)) != nw; i++)
+                IODelay(10);
+            IOLockUnlock(gpuLock);
+            gVcnLastUs = static_cast<uint32_t>((phxNowNs() - t0) / 1000);
+            gVcnWptr = nw;
+            if (rp == nw) {
+                gVcnTestsOk++;
+            } else {
+                gVcnTestsFail++;
+                gVcnLastErr = 4;
+                gVcnOn = 0;   // stuck: stop using it
+                r = ETIMEDOUT;
+            }
+        }
+    } else {
+        r = EINVAL;
+    }
+    IOLockUnlock(gVcnLock);
+    return r;
+}
+
+int PhxBringup::vcnStat(char *b, size_t n) {
+    const bool up = vcnPowered();   // registers of an unpowered VCN read 0xffffffff; do not touch them then
+    const volatile uint32_t *fence = fbAper && gq[2].ready ? reinterpret_cast<const volatile uint32_t *>(fbAper->getVirtualAddress() + gq[2].fenceOff) : nullptr;
+    return snprintf(b, n, "vcn %d stuck %d (times %d) queue %d; wptr 0x%x; tests ok %u fail %u last %u us; last err %u; submits %lld; UVD_POWER_STATUS 0x%08x UVD_STATUS 0x%08x RB_ENABLE 0x%08x RB_BASE 0x%x_%08x RB_SIZE 0x%x RPTR 0x%x WPTR 0x%x; fence 0x%x seq 0x%llx",
+                    gVcnOn, (int)gVcnStuck, (int)gVcnStuckCount, gq[2].ready ? 1 : 0, gVcnWptr, gVcnTestsOk, gVcnTestsFail, gVcnLastUs, gVcnLastErr,
+                    (long long)gVcnSubmits, mmio ? rreg(kVcnPowerStatus) : 0, up ? rreg(kVcnStatus) : 0, up ? rreg(kVcnRbEnable) : 0,
+                    up ? rreg(kVcnRbBaseHi) : 0, up ? rreg(kVcnRbBaseLo) : 0, up ? rreg(kVcnRbSize) : 0,
+                    up ? rreg(kVcnRbRptr) : 0, up ? rreg(kVcnRbWptr) : 0, fence ? fence[0] : 0, (unsigned long long)gSeq);
+}
+
+int PhxBringup::mmvmCtl(int v) {
+    if (!mmio || !gpuLock)
+        return ENXIO;
+    if (v != 0 && v != 1)
+        return EINVAL;
+    IOLockLock(gpuLock);
+    int r = 0;
+    if (v == 1 && !gMmvmOn) {
+        if (gq[2].ready && rreg(kVcnRbRptr) != rreg(kVcnRbWptr)) {
+            IOLockUnlock(gpuLock);
+            return EBUSY;   // VCN must be idle while its hub changes mode
+        }
+        if (!gMmDummy) {
+            gMmDummy = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+                                                                        4096, 0x00007FFFFFFFF000ull);
+            if (!gMmDummy || gMmDummy->prepare() != kIOReturnSuccess) {
+                OSSafeReleaseNULL(gMmDummy);
+                IOLockUnlock(gpuLock);
+                return ENOMEM;
+            }
+            bzero(gMmDummy->getBytesNoCopy(), 4096);
+        }
+        const uint64_t dpa = gMmDummy->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+        gMmvmSaved[0] = rreg(kMmL2Cntl); gMmvmSaved[1] = rreg(kMmL2Cntl3); gMmvmSaved[2] = rreg(kMmL2Cntl4);
+        gMmvmSaved[3] = rreg(kMmL2Cntl5); gMmvmSaved[4] = rreg(kMmMxL1TlbCntl); gMmvmSaved[5] = rreg(kMmFaultCntl2);
+        gMmvmSaved[6] = rreg(kMmSysapDefLsb); gMmvmSaved[7] = rreg(kMmFaultDefLo);
+        gMmvmSaved[8] = rreg(kMmSysapDefMsb); gMmvmSaved[9] = rreg(kMmFaultDefHi);
+        gMmvmBad = 0;
+        // mmhub_v3_0_1_gart_enable, without context 0 (VMID 0 = display, the VCN ring and fence, IH: all inside the
+        // system aperture, which stays as the firmware set it)
+        for (uint32_t n = 0; n < 18; n++)
+            wreg(kMmEng0Sem + n, 0);
+        for (uint32_t n = 0; n < 18; n++) {
+            wreg(kMmEng0RangeLo + 2 * n, 0xFFFFFFFFu);
+            wreg(kMmEng0RangeLo + 2 * n + 1, 0x1F);
+        }
+        wreg(kMmSysapDefLsb, static_cast<uint32_t>(dpa >> 12));
+        wreg(kMmSysapDefMsb, static_cast<uint32_t>(dpa >> 44));
+        wreg(kMmFaultDefLo, static_cast<uint32_t>(dpa >> 12));
+        wreg(kMmFaultDefHi, static_cast<uint32_t>(dpa >> 44));
+        wreg(kMmIdApLowLo, 0xFFFFFFFFu);
+        wreg(kMmIdApLowLo + 1, 0xF);
+        for (uint32_t i = 2; i < 6; i++)
+            wreg(kMmIdApLowLo + i, 0);
+        wreg(kMmFaultCntl2, 0x000E0000);
+        for (uint32_t vmid = kFirstUserVmid; vmid < kFirstUserVmid + kNumUserVmids; vmid++) {
+            wreg(kMmCtx0StartLo + 2 * vmid, 0);
+            wreg(kMmCtx0StartLo + 2 * vmid + 1, 0);
+            wreg(kMmCtx0EndLo + 2 * vmid, 0xffffffff);
+            wreg(kMmCtx0EndLo + 2 * vmid + 1, 0xf);
+        }
+        wreg(kMmL2Cntl3, 0x80130009);
+        wreg(kMmL2Cntl4, 0x00000001);
+        wreg(kMmL2Cntl5, 0x00003FE0);
+        wreg(kMmL2Cntl, 0x00080E01);
+        wreg(kMmL2Cntl2, 0x00000003);
+        wreg(kMmMxL1TlbCntl, 0x00001859);
+        if (rreg(kMmMxL1TlbCntl) != 0x1859) gMmvmBad |= 1;
+        if (rreg(kMmL2Cntl) != 0x00080E01) gMmvmBad |= 2;
+        if (rreg(kMmL2Cntl3) != 0x80130009) gMmvmBad |= 4;
+        gMmvmOn = 1;
+        for (uint32_t i = 0; i < kNumUserVmids; i++) {   // contexts already holding a VMID: mirror their roots now
+            if (!hwv[i].ctx)
+                continue;
+            const uint32_t vmid = kFirstUserVmid + i;
+            const VmCtx &c = vm[hwv[i].ctx - 1];
+            wreg(kMmCtx0BaseLo + 2 * vmid, static_cast<uint32_t>(c.phys | 1));
+            wreg(kMmCtx0BaseLo + 2 * vmid + 1, static_cast<uint32_t>(c.phys >> 32));
+            wreg(kMmCtx0Cntl + vmid, 0x01fffe07);
+        }
+        mmhubFlush(0);
+        for (uint32_t i = 0; i < kNumUserVmids; i++)
+            if (hwv[i].ctx)
+                mmhubFlush(kFirstUserVmid + i);
+        IOLog("PhxBringup: MMHUB VM on (bad 0x%x)\n", gMmvmBad);
+    } else if (v == 0 && gMmvmOn) {
+        if (gq[2].ready && !gVcnStuck && rreg(kVcnRbRptr) != rreg(kVcnRbWptr)) {
+            IOLockUnlock(gpuLock);
+            return EBUSY;
+        }
+        for (uint32_t vmid = kFirstUserVmid; vmid < kFirstUserVmid + kNumUserVmids; vmid++)
+            wreg(kMmCtx0Cntl + vmid, 0x01fffe00);
+        wreg(kMmMxL1TlbCntl, gMmvmSaved[4]);
+        wreg(kMmL2Cntl, gMmvmSaved[0]);
+        wreg(kMmL2Cntl3, gMmvmSaved[1]);
+        wreg(kMmL2Cntl4, gMmvmSaved[2]);
+        wreg(kMmL2Cntl5, gMmvmSaved[3]);
+        wreg(kMmFaultCntl2, gMmvmSaved[5]);
+        wreg(kMmSysapDefLsb, gMmvmSaved[6]);
+        wreg(kMmSysapDefMsb, gMmvmSaved[8]);
+        wreg(kMmFaultDefLo, gMmvmSaved[7]);
+        wreg(kMmFaultDefHi, gMmvmSaved[9]);
+        wreg(kMmL2Cntl2, 0x00000003);
+        gMmvmOn = 0;
+        IOLog("PhxBringup: MMHUB VM off\n");
+    }
+    IOLockUnlock(gpuLock);
+    return r;
+}
+
+int PhxBringup::mmvmStat(char *b, size_t n) {
+    if (!mmio)
+        return snprintf(b, n, "no mmio");
+    int o = snprintf(b, n, "mmvm %d bad 0x%x; MX_L1_TLB_CNTL 0x%08x L2_CNTL 0x%08x L2_CNTL3 0x%08x L2_STATUS 0x%08x; fault status 0x%08x addr 0x%x_%08x; flushes %u timeouts %u max %u us; vcn submits %lld; ctx:",
+                     gMmvmOn, gMmvmBad, rreg(kMmMxL1TlbCntl), rreg(kMmL2Cntl), rreg(kMmL2Cntl3), rreg(kMmL2Status),
+                     rreg(kMmFaultStatus), rreg(kMmFaultAddrHi), rreg(kMmFaultAddrLo), gMmvmFlushes, gMmvmFlushTimeouts,
+                     gMmvmFlushMaxUs, (long long)gVcnSubmits);
+    for (uint32_t vmid = kFirstUserVmid; vmid < kFirstUserVmid + kNumUserVmids && o > 0 && static_cast<size_t>(o) < n; vmid++)
+        o += snprintf(b + o, n - static_cast<size_t>(o), " %u:%08x/%08x", vmid, rreg(kMmCtx0Cntl + vmid),
+                      rreg(kMmCtx0BaseLo + 2 * vmid));
+    return o;
+}
+
+bool PhxBringup::vcnSubmitReady() const {
+    return gq[2].ready && !gVcnStuck && gMmvmOn && !gMmvmBad && !suspended;
+}
+
+// A VCN unified-ring frame as Linux writes it (vcn_v2_0_enc_ring_emit_ib, emit_fence, insert_end, NOP pad to 64 dw):
+// IB {2, vmid, va_lo, va_hi, len} per IB, FENCE {3, addr_lo, addr_hi, seq, TRAP} into VRAM (VMID 0), END {1}
+IOReturn PhxBringup::gpuSubmitVcn(uint32_t handle, const uint64_t *ibVa, const uint32_t *ibDw, uint32_t n, uint64_t *seqOut) {
+    if (!vcnSubmitReady() || !vmCtx(handle))
+        return kIOReturnNotReady;
+    GpuQueue &q = gq[2];
+    const uint32_t need = (n * 5 + 6 + 63) & ~63u;
+    if (need + 64 > q.ringDw)
+        return kIOReturnBadArgument;
+    IOLockLock(gpuLock);
+    for (int spin = 0;; spin++) {
+        if (!q.ready) {   // went away while this thread waited for the lock
+            IOLockUnlock(gpuLock);
+            return kIOReturnNotReady;
+        }
+        const uint64_t done = queueFence(q);
+        while (q.head != q.tail && q.fseq[q.head & 63] <= done) {
+            q.doneEnd = q.fend[q.head & 63];
+            q.head++;
+        }
+        if (q.tail - q.head < 63 && q.wptr + need - q.doneEnd <= q.ringDw - 64)
+            break;
+        if (spin > 40000) {
+            IOLockUnlock(gpuLock);
+            return kIOReturnBusy;
+        }
+        IODelay(50);
+    }
+    const uint32_t vmid = vmBind(handle);
+    if (!vmid) {
+        IOLockUnlock(gpuLock);
+        return kIOReturnBusy;
+    }
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        ringPut(q, k++, 0x00000002);   // VCN_ENC_CMD_IB
+        ringPut(q, k++, vmid);
+        ringPut(q, k++, static_cast<uint32_t>(ibVa[i]) & ~3u);
+        ringPut(q, k++, static_cast<uint32_t>(ibVa[i] >> 32) & 0xFFFF);
+        ringPut(q, k++, ibDw[i]);
+    }
+    const uint64_t seq = ++gSeq;
+    hwv[vmid - kFirstUserVmid].lastSeq = seq;
+    const uint64_t fenceMc = fbMcBase + q.fenceOff;
+    ringPut(q, k++, 0x00000003);       // VCN_ENC_CMD_FENCE
+    ringPut(q, k++, static_cast<uint32_t>(fenceMc));
+    ringPut(q, k++, static_cast<uint32_t>(fenceMc >> 32));
+    ringPut(q, k++, static_cast<uint32_t>(seq));
+    ringPut(q, k++, 0x00000004);       // VCN_ENC_CMD_TRAP
+    ringPut(q, k++, 0x00000001);       // VCN_ENC_CMD_END
+    while (k < need)
+        ringPut(q, k++, 0);            // VCN_ENC_CMD_NO_OP
+    q.wptr += k;
+    q.fseq[q.tail & 63] = seq;
+    q.fend[q.tail & 63] = q.wptr;
+    q.fvmid[q.tail & 63] = vmid;
+    gVcnSubAbs[q.tail & 63] = mach_absolute_time();
+    __asm__ __volatile__("" ::: "memory");
+    q.tail = q.tail + 1;
+    __asm__ __volatile__("sfence" ::: "memory");
+    (void)*reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + q.ringOff);
+    hdpFlush();
+    wreg(kVcnRbWptr, static_cast<uint32_t>(q.wptr & (q.ringDw - 1)));
+    OSIncrementAtomic64(&gVcnSubmits);
+    IOLockUnlock(gpuLock);
+    *seqOut = seq;
+    return kIOReturnSuccess;
+}
+
+static int phxVcnSysctl SYSCTL_HANDLER_ARGS {
+    int v = gVcnOn;
+    const int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr)
+        return err;
+    return gPhx ? gPhx->vcnCtl(v) : ENXIO;
+}
+static int phxVcnStatSysctl SYSCTL_HANDLER_ARGS {
+    char b[640];
+    const int len = gPhx ? gPhx->vcnStat(b, sizeof b) : snprintf(b, sizeof b, "no PhxBringup");
+    return SYSCTL_OUT(req, b, static_cast<size_t>(len) + 1);
+}
+static int phxMmvmSysctl SYSCTL_HANDLER_ARGS {
+    int v = gMmvmOn;
+    const int err = sysctl_handle_int(oidp, &v, 0, req);
+    if (err || !req->newptr)
+        return err;
+    return gPhx ? gPhx->mmvmCtl(v) : ENXIO;
+}
+static int phxMmvmStatSysctl SYSCTL_HANDLER_ARGS {
+    char b[768];
+    const int len = gPhx ? gPhx->mmvmStat(b, sizeof b) : snprintf(b, sizeof b, "no PhxBringup");
+    return SYSCTL_OUT(req, b, static_cast<size_t>(len) + 1);
+}
+
 // Every 500 ms: a queue with unfinished work whose fence has not moved for debug.phx_hang_ms has the waves of its oldest
 // unfinished submission killed, the CP then finishes that submission as if it had ended and the queue moves on.
 void PhxBringup::hangTick(thread_call_param_t self, thread_call_param_t) {
@@ -1147,7 +1582,7 @@ void PhxBringup::hangCheck() {
     uint64_t limit, now = mach_absolute_time();
     nanoseconds_to_absolutetime(static_cast<uint64_t>(limitMs) * 1000000ull, &limit);
     for (GpuQueue &q : gq) {
-        if (!q.ready)
+        if (!q.ready || q.vcn)   // killing waves does nothing for a video job
             continue;
         const uint64_t done = queueFence(q);
         const uint32_t tail = q.tail;
@@ -1821,8 +2256,13 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phx_hang_ms);
         sysctl_register_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_register_oid(&sysctl__debug_phxvcn);
+        sysctl_register_oid(&sysctl__debug_phxvcn_stat);
+        sysctl_register_oid(&sysctl__debug_phxmmvm);
+        sysctl_register_oid(&sysctl__debug_phxmmvm_stat);
         for (struct sysctl_oid *o : kPmOids)
             sysctl_register_oid(o);
+        gPhx = this;
     }
     if (type != PHXN_UC_TYPE)
         return kIOReturnBadArgument;
@@ -2002,7 +2442,7 @@ IOReturn IOAccelPhxNativeClient::doQueryInfo(IOExternalMethodArguments *a) {
     inf.abi_version = PHXN_ABI_VERSION;
     inf.kext_build = PHX_KEXT_BUILD;
     inf.reserved[2] = PHXN_ABI_MINOR;
-    inf.flags = PHXN_INFO_S1B_POSITIVE | PHXN_INFO_NATIVE_BOOT;
+    inf.flags = PHXN_INFO_S1B_POSITIVE | PHXN_INFO_NATIVE_BOOT | (owner->vcnSubmitReady() ? PHXN_INFO_VCN : 0u);
     inf.vmid = PHXN_VMID;
     inf.gb_addr_config = kGbAddrConfig;
     inf.gc_version = kGcVersion;
@@ -2309,8 +2749,11 @@ IOReturn IOAccelPhxNativeClient::doSubmit(IOExternalMethodArguments *a) {
     for (uint32_t i = 0; i < h.num_ibs; i++) {
         phxn_cs_ib ib;
         bcopy(in + sizeof(h) + i * sizeof(ib), &ib, sizeof(ib));
-        if (ib._pad || (ib.ip_type != PHX_AMDGPU_HW_IP_GFX && ib.ip_type != PHX_AMDGPU_HW_IP_COMPUTE) || ib.ip_instance != 0 || ib.ring != 0)
+        if (ib._pad || (ib.ip_type != PHX_AMDGPU_HW_IP_GFX && ib.ip_type != PHX_AMDGPU_HW_IP_COMPUTE &&
+                        ib.ip_type != PHX_AMDGPU_HW_IP_VCN_ENC) || ib.ip_instance != 0 || ib.ring != 0)
             return kIOReturnBadArgument;
+        if (ib.ip_type == PHX_AMDGPU_HW_IP_VCN_ENC && !owner->vcnSubmitReady())
+            return kIOReturnNotReady;   // VCN IBs need debug.phxvcn=1 and debug.phxmmvm=1
         if (ib.ib_bytes == 0 || (ib.ib_bytes & 3) || ib.ib_bytes > 0xFFFFFu * 4)
             return kIOReturnBadArgument;
         if (!vaCanonical(ib.va_start) || (ib.va_start & 3))
@@ -2373,7 +2816,15 @@ IOReturn IOAccelPhxNativeClient::doSubmit(IOExternalMethodArguments *a) {
         bcopy(in + sizeof(h), &ib0, sizeof(ib0));
         if (!ensureVmid())
             return kIOReturnNoResources;
-        const IOReturn r = owner->gpuSubmit(vmid, ib0.ip_type == PHX_AMDGPU_HW_IP_GFX, va, dw, h.num_ibs, &seq);
+        for (uint32_t i = 1; i < h.num_ibs; i++) {   // one engine per submission
+            phxn_cs_ib ibi;
+            bcopy(in + sizeof(h) + i * sizeof(ibi), &ibi, sizeof(ibi));
+            if ((ibi.ip_type == PHX_AMDGPU_HW_IP_VCN_ENC) != (ib0.ip_type == PHX_AMDGPU_HW_IP_VCN_ENC))
+                return kIOReturnBadArgument;
+        }
+        const IOReturn r = ib0.ip_type == PHX_AMDGPU_HW_IP_VCN_ENC
+                               ? owner->gpuSubmitVcn(vmid, va, dw, h.num_ibs, &seq)
+                               : owner->gpuSubmit(vmid, ib0.ip_type == PHX_AMDGPU_HW_IP_GFX, va, dw, h.num_ibs, &seq);
         if (r != kIOReturnSuccess)
             return r;
         lastSeq = seq;
@@ -2417,6 +2868,11 @@ IOReturn IOAccelPhxNativeClient::doDbgSmu(IOExternalMethodArguments *a) {
     case PHX_PPSMC_SetSoftMaxFclkByFreq:
     case PHX_PPSMC_SetHardMinSocclkByFreq:
     case PHX_PPSMC_SetSoftMaxSocclkByFreq:
+    case PHX_PPSMC_PowerUpVcn:
+        break;
+    case PHX_PPSMC_PowerDownVcn:   // only after a PowerUpVcn: a power-down of an engine that was never up hung the PMFW
+        if (!owner->vcnPowered())
+            return kIOReturnNotReady;
         break;
     default:
         return kIOReturnNotPermitted;

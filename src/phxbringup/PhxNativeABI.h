@@ -131,6 +131,8 @@ enum {
 #define PHX_PPSMC_GetEnabledSmuFeatures 0x12u
 #define PHX_PPSMC_AllowGfxOff          0x19u
 #define PHX_PPSMC_DisallowGfxOff       0x1Au
+#define PHX_PPSMC_PowerDownVcn         0x06u  /* argument 0; only after PowerUpVcn */
+#define PHX_PPSMC_PowerUpVcn           0x07u
 #define PHX_PPSMC_EnableGfxImu         0x16u  /* smu_v13_0_4_ppsmc.h: power up GFX via the IMU (APU GFX bring-up) */
 /* clocks (smu_v13_0_4_ppsmc.h; frequencies in MHz, as Linux's set_soft_freq_limited_range sends them) */
 #define PHX_PPSMC_SetHardMinSocclkByFreq 0x13u
@@ -186,6 +188,7 @@ static_assert(__builtin_offsetof(phx_smu13_0_4_metrics, MetricsCounter) == 156, 
 #define PHXN_INFO_HUNG         (1u << 0)
 #define PHXN_INFO_S1B_POSITIVE (1u << 1)
 #define PHXN_INFO_NATIVE_BOOT  (1u << 2)
+#define PHXN_INFO_VCN          (1u << 3)   /* build 38: VCN0 adopted and MMHUB VM on: VCN_ENC submissions are accepted */
 
 /* BoCreate scalar out [3] */
 #define PHXN_PLACED_CPU_MAPPABLE (1u << 0)
@@ -213,6 +216,7 @@ static_assert(__builtin_offsetof(phx_smu13_0_4_metrics, MetricsCounter) == 156, 
 #define PHX_AMDGPU_CTX_OP_QUERY_STATE2 4u
 #define PHX_AMDGPU_HW_IP_GFX 0u
 #define PHX_AMDGPU_HW_IP_COMPUTE 1u
+#define PHX_AMDGPU_HW_IP_VCN_ENC 7u
 #define PHX_AMDGPU_IB_FLAG_CE                     (1u << 0)
 #define PHX_AMDGPU_IB_FLAG_PREAMBLE               (1u << 1)
 #define PHX_AMDGPU_IB_FLAG_PREEMPT                (1u << 2)
