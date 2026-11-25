@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 44u
+#define PHX_KEXT_BUILD 45u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -89,6 +89,12 @@ static constexpr uint32_t kRegFaultCntl = 0x2824, kRegFaultStatus = 0x2828, kReg
                           kRegFaultDefLo = 0x282B, kRegFaultDefHi = 0x282C;
 static constexpr uint32_t kFaultEnableDefault = 0x00001FFCu;
 static int gFaultDef = 1;
+// debug.phx_wait_us: how long a WAITSEQ sleeps between two looks at the fences (0 = spin, the old first millisecond)
+static int gWaitUs = 250;
+static IOLock *gWaitLock;
+static char gWaitEvent;
+SYSCTL_INT(_debug, OID_AUTO, phx_wait_us, CTLFLAG_RW | CTLFLAG_LOCKED, &gWaitUs, 0,
+           "microseconds a fence wait sleeps between polls (0: spin 50 us at a time)");
 // GC TLB invalidation (engine 17): how often the ack bit was already set when the request was written, how often it
 // did not come within the bound, and the longest wait
 static volatile SInt32 gInvCount, gInvStaleAck, gInvTimeouts, gRingFlushes;
@@ -628,6 +634,7 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_unregister_oid(&sysctl__debug_phx_wait_us);
         sysctl_unregister_oid(&sysctl__debug_phx_ringflush);
         sysctl_unregister_oid(&sysctl__debug_phx_vmwalk_vmid);
         sysctl_unregister_oid(&sysctl__debug_phx_vmwalk_va);
@@ -2460,6 +2467,9 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phx_hang_ms);
         sysctl_register_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_register_oid(&sysctl__debug_phx_wait_us);
+        if (!gWaitLock)
+            gWaitLock = IOLockAlloc();
         sysctl_register_oid(&sysctl__debug_phx_ringflush);
         sysctl_register_oid(&sysctl__debug_phx_vmwalk_vmid);
         sysctl_register_oid(&sysctl__debug_phx_vmwalk_va);
@@ -3346,16 +3356,24 @@ IOReturn IOAccelPhxNativeClient::doWaitSeq(IOExternalMethodArguments *a) {
             timeout = PHXN_WAIT_CAP_NS;
         const uint32_t qm = qUsed ? qUsed : 7u;
         uint64_t retired = owner->gpuRetiredMask(qm);
-        for (uint64_t waited = 0; retired < target && waited < timeout; ) {
-            if (waited < 1000000ull) {
-                // Short wait (< 1 ms): fast poll with 50 us delay for low latency
+        // There is no fence interrupt: the wait polls. Two 50 us spins catch a job that is all but done, then the
+        // thread sleeps debug.phx_wait_us (default 250) between polls. It used to spin for the whole first millisecond
+        // and then sleep 1 ms a time: a fifth of a core in WindowServer alone while a video played (2026-11-25).
+        const uint64_t tw0 = mach_absolute_time();
+        for (uint64_t waited = 0, polls = 0; retired < target && waited < timeout; polls++) {
+            const int us = gWaitUs;
+            if (polls < 2 || us <= 0) {
                 IODelay(50);
-                waited += 50000ull;
+            } else if (gWaitLock) {
+                uint64_t dl;
+                clock_interval_to_deadline(static_cast<uint32_t>(us > 2000 ? 2000 : us), kMicrosecondScale, &dl);
+                IOLockLock(gWaitLock);
+                IOLockSleepDeadline(gWaitLock, &gWaitEvent, *reinterpret_cast<AbsoluteTime *>(&dl), THREAD_UNINT);
+                IOLockUnlock(gWaitLock);
             } else {
-                // Extended wait (>= 1 ms): yield CPU to scheduler to avoid starving WindowServer & system threads
                 IOSleep(1);
-                waited += 1000000ull;
             }
+            absolutetime_to_nanoseconds(mach_absolute_time() - tw0, &waited);
             retired = owner->gpuRetiredMask(qm);
         }
         if (retired >= target) {
