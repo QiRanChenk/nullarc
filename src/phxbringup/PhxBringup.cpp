@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 45u
+#define PHX_KEXT_BUILD 46u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -69,6 +69,11 @@ static int gVcnOn = 0, gMmvmOn = 0;
 static uint32_t gVcnWptr, gVcnTestsOk, gVcnTestsFail, gVcnLastUs, gVcnLastErr;
 static IOLock *gVcnLock;
 static uint32_t gMmvmSaved[10], gMmvmBad, gMmvmFlushTimeouts, gMmvmFlushMaxUs, gMmvmFlushes;
+static uint32_t gMmvmFlushSkipped;
+// debug.phx_mmflush_all=1: MMHUB is invalidated with every GC invalidation again (builds 38 to 45)
+static int gMmFlushAll = 0;
+SYSCTL_INT(_debug, OID_AUTO, phx_mmflush_all, CTLFLAG_RW | CTLFLAG_LOCKED, &gMmFlushAll, 0,
+           "1: invalidate MMHUB for every context, not only those VCN has run in");
 static IOBufferMemoryDescriptor *gMmDummy;
 static volatile SInt64 gVcnSubmits;
 static uint64_t gVcnSubAbs[64];                     // when each VCN ring entry was queued
@@ -385,6 +390,7 @@ private:
         bool busy;
         uint32_t hw;                      // the hardware VMID pointed at these tables, 0 = none
         uint32_t gen;                     // bumped whenever the tables or the VMID binding change (in-ring flush)
+        bool usedVcn;                     // has submitted to VCN since it was bound: only then MMHUB needs its flushes
     };
     static constexpr uint32_t kMaxCtx = 96;
     VmCtx vm[kMaxCtx]{};
@@ -634,6 +640,7 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_unregister_oid(&sysctl__debug_phx_mmflush_all);
         sysctl_unregister_oid(&sysctl__debug_phx_wait_us);
         sysctl_unregister_oid(&sysctl__debug_phx_ringflush);
         sysctl_unregister_oid(&sysctl__debug_phx_vmwalk_vmid);
@@ -938,8 +945,15 @@ void PhxBringup::vmFlushTlb(uint32_t vmid) const {
     OSIncrementAtomic(&gInvCount);
     if (us > gInvMaxUs)
         gInvMaxUs = us;
-    if (gMmvmOn)
-        mmhubFlush(vmid);
+    // MMHUB holds translations only for contexts VCN has run in. Every map and unmap of every process used to
+    // invalidate it too (several thousand times a minute, most of them WindowServer's), next to a running decode.
+    if (gMmvmOn && vmid >= kFirstUserVmid && vmid < kFirstUserVmid + kNumUserVmids) {
+        const uint32_t h = hwv[vmid - kFirstUserVmid].ctx;
+        if (gMmFlushAll || (h && vm[h - 1].usedVcn))
+            mmhubFlush(vmid);
+        else
+            gMmvmFlushSkipped++;
+    }
 }
 
 // gmc_v11_0_flush_gpu_tlb on MMHUB (engine 17, with its semaphore: a read that returns 1 takes it)
@@ -1027,6 +1041,7 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
     const uint32_t vmid = kFirstUserVmid + static_cast<uint32_t>(pick);
     c.hw = vmid;
     c.gen++;
+    c.usedVcn = false;
     GfxGuard awake(this);
     wreg(kRegCtx0BaseLo + 2 * vmid, static_cast<uint32_t>(c.phys | 3));
     wreg(kRegCtx0BaseLo + 2 * vmid + 1, static_cast<uint32_t>(c.phys >> 32));
@@ -1043,6 +1058,7 @@ uint32_t PhxBringup::vmBind(uint32_t handle) {
         wreg(kMmCtx0EndLo + 2 * vmid, 0xffffffff);
         wreg(kMmCtx0EndLo + 2 * vmid + 1, 0xf);
         wreg(kMmCtx0Cntl + vmid, 0x01fffe07);
+        mmhubFlush(vmid);   // whatever the VMID's last owner left there
     }
     vmFlushTlb(vmid);
     return vmid;
@@ -1650,9 +1666,9 @@ int PhxBringup::mmvmCtl(int v) {
 int PhxBringup::mmvmStat(char *b, size_t n) {
     if (!mmio)
         return snprintf(b, n, "no mmio");
-    int o = snprintf(b, n, "mmvm %d bad 0x%x; MX_L1_TLB_CNTL 0x%08x L2_CNTL 0x%08x L2_CNTL3 0x%08x L2_STATUS 0x%08x; fault status 0x%08x addr 0x%x_%08x; flushes %u timeouts %u max %u us; vcn submits %lld; ctx:",
+    int o = snprintf(b, n, "mmvm %d bad 0x%x; MX_L1_TLB_CNTL 0x%08x L2_CNTL 0x%08x L2_CNTL3 0x%08x L2_STATUS 0x%08x; fault status 0x%08x addr 0x%x_%08x; flushes %u (skipped %u) timeouts %u max %u us; vcn submits %lld; ctx:",
                      gMmvmOn, gMmvmBad, rreg(kMmMxL1TlbCntl), rreg(kMmL2Cntl), rreg(kMmL2Cntl3), rreg(kMmL2Status),
-                     rreg(kMmFaultStatus), rreg(kMmFaultAddrHi), rreg(kMmFaultAddrLo), gMmvmFlushes, gMmvmFlushTimeouts,
+                     rreg(kMmFaultStatus), rreg(kMmFaultAddrHi), rreg(kMmFaultAddrLo), gMmvmFlushes, gMmvmFlushSkipped, gMmvmFlushTimeouts,
                      gMmvmFlushMaxUs, (long long)gVcnSubmits);
     for (uint32_t vmid = kFirstUserVmid; vmid < kFirstUserVmid + kNumUserVmids && o > 0 && static_cast<size_t>(o) < n; vmid++)
         o += snprintf(b + o, n - static_cast<size_t>(o), " %u:%08x/%08x", vmid, rreg(kMmCtx0Cntl + vmid),
@@ -1701,6 +1717,10 @@ IOReturn PhxBringup::gpuSubmitVcn(uint32_t handle, const uint64_t *ibVa, const u
     if (!vmid) {
         IOLockUnlock(gpuLock);
         return kIOReturnBusy;
+    }
+    if (!vm[handle - 1].usedVcn) {   // from here on this context's maps and unmaps invalidate MMHUB too
+        vm[handle - 1].usedVcn = true;
+        mmhubFlush(vmid);
     }
     uint32_t k = 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -2467,6 +2487,7 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phx_hang_ms);
         sysctl_register_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_register_oid(&sysctl__debug_phx_mmflush_all);
         sysctl_register_oid(&sysctl__debug_phx_wait_us);
         if (!gWaitLock)
             gWaitLock = IOLockAlloc();
