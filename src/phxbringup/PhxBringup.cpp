@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 39u
+#define PHX_KEXT_BUILD 40u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -83,6 +83,10 @@ static constexpr uint32_t kRegFaultCntl = 0x2824, kRegFaultStatus = 0x2828, kReg
                           kRegFaultDefLo = 0x282B, kRegFaultDefHi = 0x282C;
 static constexpr uint32_t kFaultEnableDefault = 0x00001FFCu;
 static int gFaultDef = 1;
+// GC TLB invalidation (engine 17): how often the ack bit was already set when the request was written, how often it
+// did not come within the bound, and the longest wait
+static volatile SInt32 gInvCount, gInvStaleAck, gInvTimeouts;
+static uint32_t gInvMaxUs;
 static IOBufferMemoryDescriptor *gFaultPage;
 static uint32_t gFaultDefApplied;
 SYSCTL_INT(_debug, OID_AUTO, phx_faultdef, CTLFLAG_RW | CTLFLAG_LOCKED, &gFaultDef, 0,
@@ -881,9 +885,19 @@ uint64_t *PhxBringup::vmPte(VmCtx &c, uint64_t va, bool alloc) {
 void PhxBringup::vmFlushTlb(uint32_t vmid) const {
     GfxGuard awake(this);
     __asm__ __volatile__("mfence" ::: "memory");
+    if (rreg(kRegInvEng17Ack) & (1u << vmid))
+        OSIncrementAtomic(&gInvStaleAck);
     wreg(kRegInvEng17Req, 0x00F80000u | (1u << vmid) | 1u);
-    for (int i = 0; i < 1000 && !(rreg(kRegInvEng17Ack) & (1u << vmid)); i++)
-        IODelay(1);
+    // up to 100 ms (was 1 ms, and a missing ack went unnoticed): a submission must not run on stale translations
+    uint32_t us = 0;
+    while (!(rreg(kRegInvEng17Ack) & (1u << vmid))) {
+        if (us >= 100000) { OSIncrementAtomic(&gInvTimeouts); break; }
+        IODelay(us < 1000 ? 1 : 10);
+        us += us < 1000 ? 1 : 10;
+    }
+    OSIncrementAtomic(&gInvCount);
+    if (us > gInvMaxUs)
+        gInvMaxUs = us;
     if (gMmvmOn)
         mmhubFlush(vmid);
 }
@@ -1293,9 +1307,10 @@ int PhxBringup::gcFaultStat(char *b, size_t n) {
         return snprintf(b, n, "gpu not ready");
     GfxGuard awake(this);
     const uint32_t st = rreg(kRegFaultStatus);
-    return snprintf(b, n, "applied %u; FAULT_CNTL 0x%08x DEFAULT 0x%x_%08x; STATUS 0x%08x (vmid %u cid %u rw %u) ADDR 0x%x_%08x (page)",
+    return snprintf(b, n, "applied %u; FAULT_CNTL 0x%08x DEFAULT 0x%x_%08x; STATUS 0x%08x (vmid %u cid %u rw %u) ADDR 0x%x_%08x (page); tlb flushes %d stale-ack %d timeouts %d max %u us",
                     gFaultDefApplied, rreg(kRegFaultCntl), rreg(kRegFaultDefHi), rreg(kRegFaultDefLo), st, (st >> 20) & 15,
-                    (st >> 9) & 0x1ff, (st >> 18) & 1, rreg(kRegFaultAddrHi), rreg(kRegFaultAddrLo));
+                    (st >> 9) & 0x1ff, (st >> 18) & 1, rreg(kRegFaultAddrHi), rreg(kRegFaultAddrLo), (int)gInvCount, (int)gInvStaleAck,
+                    (int)gInvTimeouts, gInvMaxUs);
 }
 
 // gpuLock held (or no submitter left): the hardware state behind the VCN queue and the MMHUB setup is gone
@@ -1597,7 +1612,7 @@ IOReturn PhxBringup::gpuSubmitVcn(uint32_t handle, const uint64_t *ibVa, const u
 }
 
 static int phxGcFaultStatSysctl SYSCTL_HANDLER_ARGS {
-    char b[256];
+    char b[384];
     const int len = gPhx ? gPhx->gcFaultStat(b, sizeof b) : snprintf(b, sizeof b, "no PhxBringup");
     return SYSCTL_OUT(req, b, static_cast<size_t>(len) + 1);
 }
