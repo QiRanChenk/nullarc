@@ -14,6 +14,7 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include <pexpert/pexpert.h>
 #include <kern/thread_call.h>
+#include "phxscale_tables.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IORangeAllocator.h>
 #include <IOKit/IOSubMemoryDescriptor.h>
@@ -269,6 +270,7 @@ class PhxAMDFB : public IOFramebuffer {
             if (us > gVblLateUsMax) gVblLateUsMax = us;
         }
         if (!hd) OSAddAtomic64(1, &gVblN);
+        if (!hd && me->fXCur >= 0 && (++me->fXTick & 127) == 0) me->scaleCheck();
         gPhxVblLastAbs[hd] = due ? due : at;   // the vblank this tick stands for
         __atomic_add_fetch(&gPhxVblSeq[hd], 1, __ATOMIC_RELEASE);
         for (const Irq &q : me->fVbl) {
@@ -561,15 +563,140 @@ public:
     bool isConsoleDevice() override { return !fBeside; }
     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override {
         if (aperture != kIOFBSystemAperture) return nullptr;
+        if (fXCur >= 0) return IODeviceMemory::withRange(fXPhys, (IOPhysicalLength)curRow() * curH());
         return IODeviceMemory::withRange(fBase, (IOPhysicalLength)fRowBytes * fHeight);
     }
     IODeviceMemory *getVRAMRange() override { return getApertureRange(kIOFBSystemAperture); }
     const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
-    // Probe (scaled-probe branch): the panel also lists larger rasters macOS could halve into HiDPI 1440x900, 1680x1050
-    // and 1920x1200. They are listed only; setDisplayMode refuses them (no scaler is programmed yet). -phxscaleoff: off.
+    // Scaled modes: the panel also offers rasters larger than its own (2880x1800, 3360x2100, 3840x2400), which macOS
+    // halves into the HiDPI looks 1440x900, 1680x1050 and 1920x1200. WindowServer's frames are copied into a buffer of
+    // that size in an unused part of the carve-out (kXOff), and the display pipe's scaler (DPP0 DSCL, 4-tap filter)
+    // shrinks it to the panel: HUBP0 scans the buffer with a viewport of the raster, DSCL0 takes it to 2560x1600. The
+    // register values are Linux amdgpu's for the same plane scaling on this machine (phxscale_tables.h). The firmware
+    // runs HUBP0 with TTU off, so none of Linux's DLG/TTU/watermark values apply; only the scaler and the surface change.
+    // -phxscaleoff: native only.
     static constexpr uint32_t kXW[3] = { 2880, 3360, 3840 }, kXH[3] = { 1800, 2100, 2400 };
+    // VRAM 256 MiB..+36 MiB: past the BAR (the firmware areas, the external heads and the GOP's DMUB windows all sit
+    // below 0x0e000000) and far below the DMUB mailbox at the top of the 512 MiB carve-out (0x1fe00000).
+    static constexpr uint64_t kXOff = 0x10000000ull, kXBytes = 0x2400000ull;
     bool fXModes = false;
+    int fXCur = -1;                    // the scaled mode on the panel (index into kXW), -1 = native
+    unsigned fXTick = 0;
+    IOMemoryMap *fXMap = nullptr;      // the scaled buffer through its system-RAM address (write-back, see fAliasMap)
+    uint64_t fXPhys = 0, fXMc = 0;     // its system physical address and its GPU (MC) address
+    IOLock *fXLock = nullptr;
+    // native values of everything a scaled mode writes, read before the first switch away from native
+    enum { kXSaveMax = 40 };
+    PhxRegVal fXSave[kXSaveMax] = {}; unsigned fXSaveN = 0;
     int xmode(IODisplayModeID m) const { return (fXModes && m >= 2 && m <= 4) ? (int)m - 2 : -1; }
+    uint32_t curW() const { return fXCur >= 0 ? kXW[fXCur] : fWidth; }
+    uint32_t curH() const { return fXCur >= 0 ? kXH[fXCur] : fHeight; }
+    uint32_t curRow() const { return fXCur >= 0 ? kXW[fXCur] * 4 : fRowBytes; }
+    static const PhxRegVal *xTable(int x, unsigned *n) {
+        switch (x) {
+        case 0: *n = sizeof kScale2880 / sizeof kScale2880[0]; return kScale2880;
+        case 1: *n = sizeof kScale3360 / sizeof kScale3360[0]; return kScale3360;
+        default: *n = sizeof kScale3840 / sizeof kScale3840[0]; return kScale3840;
+        }
+    }
+    // the carve-out's system physical and MC addresses, published by PhxBringup (0 until it has run)
+    bool carveOut(uint64_t *phys, uint64_t *mc, uint64_t *size) {
+        *phys = *mc = *size = 0;
+        if (OSIterator *it = fPCI->getChildIterator(gIOServicePlane)) {
+            while (OSObject *o = it->getNextObject()) {
+                IORegistryEntry *e = OSDynamicCast(IORegistryEntry, o);
+                OSNumber *p = e ? OSDynamicCast(OSNumber, e->getProperty("phx-fb-phys")) : nullptr;
+                OSNumber *m = e ? OSDynamicCast(OSNumber, e->getProperty("phx-fb-mc-base")) : nullptr;
+                OSNumber *z = e ? OSDynamicCast(OSNumber, e->getProperty("phx-fb-size")) : nullptr;
+                if (p && m && z) { *phys = p->unsigned64BitValue(); *mc = m->unsigned64BitValue(); *size = z->unsigned64BitValue(); break; }
+            }
+            it->release();
+        }
+        return *phys && *mc && *size >= kXOff + kXBytes;
+    }
+    enum : uint32_t { kOtg0Lock = 0x504a, kSclMode = 0x41bb, kPitch = 0x3ac7, kAddr = 0x3aca, kAddrHi = 0x3acb };
+    void xSave(volatile uint32_t *r) {
+        unsigned n; const PhxRegVal *t = xTable(0, &n);
+        fXSaveN = 0;
+        for (unsigned i = 0; i < n && fXSaveN < kXSaveMax; i++) fXSave[fXSaveN++] = { t[i].reg, r[t[i].reg] };
+        static const uint16_t kMore[] = { kSclMode, kPitch, kAddrHi, kAddr };
+        for (uint16_t g : kMore) if (fXSaveN < kXSaveMax) fXSave[fXSaveN++] = { g, r[g] };
+    }
+    // program pipe 0 for scaled mode x (or the saved native state for x < 0), all inside one OTG0 master lock
+    void xProgram(int x) {
+        volatile uint32_t *r = (volatile uint32_t *)fMmio->getVirtualAddress();
+        r[kOtg0Lock] = 1;
+        if (x < 0) {
+            for (unsigned i = 0; i < fXSaveN; i++) r[fXSave[i].reg] = fXSave[i].val;
+        } else {
+            // Coefficients go to the RAM the scaler is not using (SCL_COEF_RAM_SELECT_CURRENT, bit 12); selecting it
+            // (SCL_COEF_RAM_SELECT, bit 8) swaps at the update, as Linux's dpp1_dscl_set_scl_filter does.
+            const uint32_t cur = (r[kSclMode] >> 12) & 1;
+            r[kSclMode] = 1u | cur << 8;
+            unsigned n; const PhxRegVal *t = xTable(x, &n);
+            for (unsigned i = 0; i < n; i++) r[t[i].reg] = t[i].val;
+            const PhxRegVal *c = x == 2 ? kCoef149 : kCoef116;
+            const unsigned cn = x == 2 ? sizeof kCoef149 / sizeof kCoef149[0] : sizeof kCoef116 / sizeof kCoef116[0];
+            for (unsigned i = 0; i < cn; i++) r[c[i].reg] = c[i].val;
+            r[kSclMode] = 1u | (cur ^ 1u) << 8;
+            r[kPitch] = kXW[x] - 1;
+            r[kAddrHi] = (uint32_t)(fXMc >> 32);
+            r[kAddr] = (uint32_t)fXMc;
+        }
+        r[kOtg0Lock] = 0;
+    }
+    // Something put the firmware's native scan-out back under a scaled mode (a hibernation, the firmware on a wake):
+    // the panel would freeze on the old frame at VRAM 0. Called from the VBL timer about once a second.
+    void scaleCheck() {
+        if (fXCur < 0 || !fMmio || !fXLock || !IOLockTryLock(fXLock)) return;
+        volatile uint32_t *r = (volatile uint32_t *)fMmio->getVirtualAddress();
+        if (fXCur >= 0 && (r[kAddr] != (uint32_t)fXMc || r[0x3aaa] != (kXH[fXCur] << 16 | kXW[fXCur]))) {
+            PFBLOG("scale: pipe 0 lost the %ux%u setup (address 0x%x, viewport 0x%x): programming it again",
+                   kXW[fXCur], kXH[fXCur], r[kAddr], r[0x3aaa]);
+            xProgram(fXCur);
+        }
+        IOLockUnlock(fXLock);
+    }
+    IOReturn setScaled(int x) {
+        if (!fMmio || fHead || !fXLock) return kIOReturnUnsupported;
+        IOLockLock(fXLock);
+        IOReturn ret = kIOReturnSuccess;
+        if (x >= 0 && !fXMap) {
+            uint64_t phys, mc, size;
+            if (!carveOut(&phys, &mc, &size)) {
+                PFBLOG("scale: the carve-out is not known yet (phys 0x%llx mc 0x%llx size 0x%llx): %ux%u refused", phys, mc, size, kXW[x], kXH[x]);
+                ret = kIOReturnNotReady;
+            } else if (IODeviceMemory *dm = IODeviceMemory::withRange(phys + kXOff, kXBytes)) {
+                fXMap = dm->map(kIOMapWriteCombineCache); dm->release();
+                if (fXMap) {
+                    fXPhys = phys + kXOff; fXMc = mc + kXOff;
+                    const volatile uint32_t *p = (const volatile uint32_t *)fXMap->getVirtualAddress();
+                    unsigned nz = 0; for (uint64_t w = 0; w < kXBytes / 4; w += 4096) nz += p[w] != 0;
+                    PFBLOG("scale: buffer at VRAM 0x%llx = system 0x%llx, MC 0x%llx (%u of %llu samples were non-zero)",
+                           kXOff, fXPhys, fXMc, nz, kXBytes / 4 / 4096);
+                }
+            }
+            if (!fXMap && ret == kIOReturnSuccess) { PFBLOG("scale: the buffer would not map"); ret = kIOReturnNoMemory; }
+        }
+        if (ret == kIOReturnSuccess && x != fXCur) {
+            volatile uint32_t *r = (volatile uint32_t *)fMmio->getVirtualAddress();
+            if (x >= 0) {
+                if (fXCur < 0) xSave(r);
+                // black (opaque) until WindowServer's first frame of the new size; non-temporal like the frame copies
+                uint64_t *px = (uint64_t *)fXMap->getVirtualAddress();
+                for (uint64_t i = 0, n = (uint64_t)kXW[x] * kXH[x] / 2; i < n; i++) __builtin_nontemporal_store(0xff000000ff000000ull, &px[i]);
+                __asm__ __volatile__("sfence" ::: "memory");
+            }
+            const int was = fXCur;
+            fXCur = x;
+            xProgram(x);
+            PFBLOG("scale: %ux%u -> %ux%u on the panel", was >= 0 ? kXW[was] : fWidth, was >= 0 ? kXH[was] : fHeight,
+                   x >= 0 ? kXW[x] : fWidth, x >= 0 ? kXH[x] : fHeight);
+            setProperty("PhxFBScaledMode", x >= 0 ? kXW[x] : 0, 32);
+        }
+        IOLockUnlock(fXLock);
+        return ret;
+    }
     IOItemCount getDisplayModeCount() override { return fXModes ? 4 : 1; }
     IOReturn getDisplayModes(IODisplayModeID *modes) override {
         modes[0] = fModeID; if (fXModes) for (int i = 0; i < 3; i++) modes[1 + i] = 2 + i;
@@ -605,11 +732,14 @@ public:
         pi->activeWidth = x >= 0 ? kXW[x] : fWidth; pi->activeHeight = x >= 0 ? kXH[x] : fHeight;
         return kIOReturnSuccess;
     }
-    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = fModeID; *depth = 0; return kIOReturnSuccess; }
-    IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { return getCurrentDisplayMode(mode, depth); }
+    IOReturn getCurrentDisplayMode(IODisplayModeID *mode, IOIndex *depth) override {
+        *mode = fXCur >= 0 ? 2 + fXCur : fModeID; *depth = 0; return kIOReturnSuccess; }
+    IOReturn getStartupDisplayMode(IODisplayModeID *mode, IOIndex *depth) override { *mode = fModeID; *depth = 0; return kIOReturnSuccess; }
     IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override {
-        if (xmode(mode) >= 0) { PFBLOG("probe: setDisplayMode(%d) asked for %ux%u, refused (no scaler yet)", (int)mode, kXW[xmode(mode)], kXH[xmode(mode)]); return kIOReturnUnsupported; }
-        return (mode == fModeID && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported; }
+        if (depth != 0) return kIOReturnUnsupported;
+        if (const int x = xmode(mode); x >= 0) return setScaled(x);
+        if (mode != fModeID) return kIOReturnUnsupported;
+        return (fXCur >= 0) ? setScaled(-1) : kIOReturnSuccess; }
     IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) override {
         if ((mode != fModeID && xmode(mode) < 0) || !info) return kIOReturnUnsupportedMode;
         bzero(info, sizeof(*info));
@@ -796,6 +926,12 @@ public:
             NVRMVramRequest *r = (NVRMVramRequest *)p1;
             if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
             if (!fSurfMap) return kIOReturnNotReady;
+            if (const int x = fXCur; x >= 0 && fXMap) {   // a scaled mode: the frame goes to the large buffer
+                r->kva = (void *)fXMap->getVirtualAddress();
+                r->phys = fXPhys; r->actualSize = round_page_64((uint64_t)kXW[x] * 4 * kXH[x]);
+                r->width = kXW[x]; r->height = kXH[x]; r->pitch = kXW[x] * 4;
+                return kIOReturnSuccess;
+            }
             IOMemoryMap *alias = gAlias ? aliasMap() : nullptr;
             r->kva = (void *)(alias ? alias : fSurfMap)->getVirtualAddress();
             r->phys = fBase; r->actualSize = round_page_64((uint64_t)fRowBytes * fHeight);
@@ -1041,7 +1177,9 @@ bool PhxAMDFB::start(IOService *provider)
         if (const uint32_t u = blLoad()) { fBlUser = fBlLastOn = u; backlightWrite(u); PFBLOG("backlight: the user's level %u from NVRAM", u); }
     }
     fHiRes = !PE_parse_boot_argn("-phxhidpioff", arg, sizeof arg);   // start() is the panel (head 0)
-    fXModes = fHiRes && !PE_parse_boot_argn("-phxscaleoff", arg, sizeof arg);
+    fXModes = fHiRes && fMmio && !PE_parse_boot_argn("-phxscaleoff", arg, sizeof arg);
+    if (fXModes) fXLock = IOLockAlloc();
+    if (!fXLock) fXModes = false;
     setProperty("PhxFBHiResModeFlag", fHiRes);
     PFBLOG("HiRes (HiDPI) mode flag %s for %ux%u", fHiRes ? "on" : "off (-phxhidpioff)", fWidth, fHeight);
     if (!IOFramebuffer::start(provider)) {
@@ -1168,6 +1306,9 @@ void PhxAMDFB::stop(IOService *provider)
     if (fBlSaveCall) { thread_call_cancel(fBlSaveCall); while (!thread_call_free(fBlSaveCall)) { thread_call_cancel(fBlSaveCall); IOSleep(5); } fBlSaveCall = nullptr; }
     gPhxFrameAbs[fHead] = 0;
     if (fBacklight) { fBacklight->terminate(); OSSafeReleaseNULL(fBacklight); }
+    if (fXCur >= 0 && fMmio) { fXCur = -1; xProgram(-1); }   // the firmware's native scan-out back before the buffer goes
+    OSSafeReleaseNULL(fXMap);
+    if (fXLock) { IOLockFree(fXLock); fXLock = nullptr; }
     OSSafeReleaseNULL(fMmio);
     OSSafeReleaseNULL(fAliasMap);
     OSSafeReleaseNULL(fSurfMap);
