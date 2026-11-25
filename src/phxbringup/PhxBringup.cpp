@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 42u
+#define PHX_KEXT_BUILD 43u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -73,6 +73,11 @@ static IOBufferMemoryDescriptor *gMmDummy;
 static volatile SInt64 gVcnSubmits;
 static uint64_t gVcnSubAbs[64];                     // when each VCN ring entry was queued
 static volatile SInt32 gVcnStuck, gVcnStuckCount;   // a VCN job older than 2 s: it stops holding the GFX waits back
+// A VCN submission whose fence never appeared although the ring went idle (RPTR == WPTR): seen twice on 2026-11-25
+// about a minute into an AV1 stream. The queue is then taken as finished up to gVcnForced, so the client's wait ends
+// and decoding goes on, instead of the queue being marked stuck for good.
+static uint64_t gVcnForced, gVcnLostSeq;
+static uint32_t gVcnLostFence, gVcnLostFences, gVcnLostAgeMs;
 // debug.phx_faultdef (default 1): when the gfx queue is adopted, the GFX hub gets what Linux gives it
 // (gfxhub_v3_0_3_init_system_aperture_regs + set_fault_enable_default): a wired, zeroed 4 KiB system page as
 // GCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR and the eleven *_ENABLE_DEFAULT bits. The bring-up leaves FAULT_CNTL at 0x2:
@@ -1176,7 +1181,7 @@ uint64_t PhxBringup::queueFence(const GpuQueue &q) const {
         uint64_t v = (cur & ~0xFFFFFFFFull) | f[0];
         if (v > cur)
             v -= 1ull << 32;
-        return v;
+        return v > gVcnForced ? v : gVcnForced;
     }
     return static_cast<uint64_t>(f[0]) | (static_cast<uint64_t>(f[1]) << 32);
 }
@@ -1194,11 +1199,25 @@ uint64_t PhxBringup::gpuRetired() const {
         const uint32_t tail = q.tail;
         for (uint32_t i = q.head; i != tail; i++) {
             if (q.fseq[i & 63] > done && q.vcn) {
+                uint64_t ns;
+                absolutetime_to_nanoseconds(mach_absolute_time() - gVcnSubAbs[i & 63], &ns);
+                // the ring has been consumed but the fence did not move: the fence write was lost, not the job
+                if (ns > 500000000ull && rreg(kVcnRbRptr) == static_cast<uint32_t>(q.wptr & (q.ringDw - 1)) &&
+                    rreg(kVcnRbWptr) == static_cast<uint32_t>(q.wptr & (q.ringDw - 1))) {
+                    const uint64_t last = q.fseq[(tail - 1) & 63];
+                    if (last > gVcnForced) {
+                        gVcnLostSeq = q.fseq[i & 63];
+                        gVcnLostFence = static_cast<uint32_t>(done);
+                        gVcnLostAgeMs = static_cast<uint32_t>(ns / 1000000);
+                        gVcnLostFences++;
+                        gVcnForced = last;
+                    }
+                    gVcnStuck = 0;
+                    break;   // everything on this queue counts as finished
+                }
                 // a hung VCN must not stall the GFX waits: past 2 s the entry stops counting
                 if (gVcnStuck)
                     break;
-                uint64_t ns;
-                absolutetime_to_nanoseconds(mach_absolute_time() - gVcnSubAbs[i & 63], &ns);
                 if (ns > 2000000000ull) {
                     if (OSCompareAndSwap(0, 1, reinterpret_cast<volatile UInt32 *>(&gVcnStuck)))
                         OSIncrementAtomic(&gVcnStuckCount);
@@ -1453,6 +1472,7 @@ int PhxBringup::vcnCtl(int v) {
                 q.fenceOff = static_cast<uint32_t>(off + 0x1000);
                 q.wptr = q.doneEnd = wp;
                 gVcnStuck = 0;
+                gVcnForced = 0;
                 *reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + q.fenceOff) = static_cast<uint32_t>(gSeq);
                 __asm__ __volatile__("sfence" ::: "memory");
                 hdpFlush();
@@ -1504,9 +1524,10 @@ int PhxBringup::vcnCtl(int v) {
 int PhxBringup::vcnStat(char *b, size_t n) {
     const bool up = vcnPowered();   // registers of an unpowered VCN read 0xffffffff; do not touch them then
     const volatile uint32_t *fence = fbAper && gq[2].ready ? reinterpret_cast<const volatile uint32_t *>(fbAper->getVirtualAddress() + gq[2].fenceOff) : nullptr;
-    return snprintf(b, n, "vcn %d stuck %d (times %d) queue %d; wptr 0x%x; tests ok %u fail %u last %u us; last err %u; submits %lld; UVD_POWER_STATUS 0x%08x UVD_STATUS 0x%08x RB_ENABLE 0x%08x RB_BASE 0x%x_%08x RB_SIZE 0x%x RPTR 0x%x WPTR 0x%x; fence 0x%x seq 0x%llx",
+    return snprintf(b, n, "vcn %d stuck %d (times %d) queue %d; wptr 0x%x; tests ok %u fail %u last %u us; last err %u; submits %lld; lost fences %u (last: seq 0x%llx fence 0x%x after %u ms); UVD_POWER_STATUS 0x%08x UVD_STATUS 0x%08x RB_ENABLE 0x%08x RB_BASE 0x%x_%08x RB_SIZE 0x%x RPTR 0x%x WPTR 0x%x; fence 0x%x seq 0x%llx",
                     gVcnOn, (int)gVcnStuck, (int)gVcnStuckCount, gq[2].ready ? 1 : 0, gVcnWptr, gVcnTestsOk, gVcnTestsFail, gVcnLastUs, gVcnLastErr,
-                    (long long)gVcnSubmits, mmio ? rreg(kVcnPowerStatus) : 0, up ? rreg(kVcnStatus) : 0, up ? rreg(kVcnRbEnable) : 0,
+                    (long long)gVcnSubmits, gVcnLostFences, (unsigned long long)gVcnLostSeq, gVcnLostFence, gVcnLostAgeMs,
+                    mmio ? rreg(kVcnPowerStatus) : 0, up ? rreg(kVcnStatus) : 0, up ? rreg(kVcnRbEnable) : 0,
                     up ? rreg(kVcnRbBaseHi) : 0, up ? rreg(kVcnRbBaseLo) : 0, up ? rreg(kVcnRbSize) : 0,
                     up ? rreg(kVcnRbRptr) : 0, up ? rreg(kVcnRbWptr) : 0, fence ? fence[0] : 0, (unsigned long long)gSeq);
 }
