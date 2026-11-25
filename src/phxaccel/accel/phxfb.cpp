@@ -270,7 +270,7 @@ class PhxAMDFB : public IOFramebuffer {
             if (us > gVblLateUsMax) gVblLateUsMax = us;
         }
         if (!hd) OSAddAtomic64(1, &gVblN);
-        if (!hd && me->fXCur >= 0 && (++me->fXTick & 127) == 0) me->scaleCheck();
+        if (!hd && me->fXCur >= 0 && (++me->fXTick & 15) == 0) me->scaleCheck();   // ~8 times a second at 120 Hz
         gPhxVblLastAbs[hd] = due ? due : at;   // the vblank this tick stands for
         __atomic_add_fetch(&gPhxVblSeq[hd], 1, __ATOMIC_RELEASE);
         for (const Irq &q : me->fVbl) {
@@ -518,7 +518,7 @@ public:
         if (!fBlSaved) fBlSaved = fBlUser ? fBlUser : fBlLastOn;   // already dark (the lid): the level to come back to is the last one above 0
         if (on && fBlUser) fBlSaved = fBlUser;   // not what the firmware left in the PWM over a hibernation
         fBlDark = !on;
-        if (on) backlightWrite(fBlSaved);
+        if (on) { scaleCheck(); backlightWrite(fBlSaved); }
         fBacklight->setProperty("PhxDark", fBlDark);
         PFBLOG("backlight: display power %s, level %u", on ? "on" : "off", fBlSaved);
     }
@@ -649,7 +649,8 @@ public:
         r[kOtg0Lock] = 0;
     }
     // Something put the firmware's native scan-out back under a scaled mode (a hibernation, the firmware on a wake):
-    // the panel would freeze on the old frame at VRAM 0. Called from the VBL timer about once a second.
+    // the panel would freeze on the old frame at VRAM 0. Called from the VBL timer every 16 ticks, and before the
+    // backlight comes back on (a wake: the firmware's native scan-out showed for about a second, 2026-11-25).
     void scaleCheck() {
         if (fXCur < 0 || !fMmio || !fXLock || !IOLockTryLock(fXLock)) return;
         volatile uint32_t *r = (volatile uint32_t *)fMmio->getVirtualAddress();
