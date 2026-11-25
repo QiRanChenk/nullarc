@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 38u
+#define PHX_KEXT_BUILD 39u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -73,6 +73,23 @@ static IOBufferMemoryDescriptor *gMmDummy;
 static volatile SInt64 gVcnSubmits;
 static uint64_t gVcnSubAbs[64];                     // when each VCN ring entry was queued
 static volatile SInt32 gVcnStuck, gVcnStuckCount;   // a VCN job older than 2 s: it stops holding the GFX waits back
+// debug.phx_faultdef (default 1): when the gfx queue is adopted, the GFX hub gets what Linux gives it
+// (gfxhub_v3_0_3_init_system_aperture_regs + set_fault_enable_default): a wired, zeroed 4 KiB system page as
+// GCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR and the eleven *_ENABLE_DEFAULT bits. The bring-up leaves FAULT_CNTL at 0x2:
+// an access that faults in a user VMID is then redirected nowhere and never completes, which stops the whole GFX
+// engine (2026-11-25: one client's unmapped IB froze WindowServer behind it; Vermilion b126 saw the same on Navi 31).
+// debug.phx_gcfault_stat shows the registers and the last fault.
+static constexpr uint32_t kRegFaultCntl = 0x2824, kRegFaultStatus = 0x2828, kRegFaultAddrLo = 0x2829, kRegFaultAddrHi = 0x282A,
+                          kRegFaultDefLo = 0x282B, kRegFaultDefHi = 0x282C;
+static constexpr uint32_t kFaultEnableDefault = 0x00001FFCu;
+static int gFaultDef = 1;
+static IOBufferMemoryDescriptor *gFaultPage;
+static uint32_t gFaultDefApplied;
+SYSCTL_INT(_debug, OID_AUTO, phx_faultdef, CTLFLAG_RW | CTLFLAG_LOCKED, &gFaultDef, 0,
+           "1: give the GFX hub a protection-fault default page when the gfx queue is adopted");
+static int phxGcFaultStatSysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, phx_gcfault_stat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, phxGcFaultStatSysctl, "A",
+            "GFX hub protection fault registers");
 static int phxVcnSysctl SYSCTL_HANDLER_ARGS;
 static int phxVcnStatSysctl SYSCTL_HANDLER_ARGS;
 static int phxMmvmSysctl SYSCTL_HANDLER_ARGS;
@@ -244,6 +261,8 @@ public:
     IOReturn vmUnmap(uint32_t vmid, uint64_t va, uint64_t size);
     IOReturn gpuSubmit(uint32_t vmid, bool gfx, const uint64_t *ibVa, const uint32_t *ibDw, uint32_t n, uint64_t *seq);
     uint64_t gpuRetired() const;
+    void faultDefaultOn();
+    int gcFaultStat(char *b, size_t n);
     int vcnCtl(int v);
     int vcnStat(char *b, size_t n);
     int mmvmCtl(int v);
@@ -577,6 +596,8 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_unregister_oid(&sysctl__debug_phx_faultdef);
+        sysctl_unregister_oid(&sysctl__debug_phx_gcfault_stat);
         sysctl_unregister_oid(&sysctl__debug_phxvcn);
         sysctl_unregister_oid(&sysctl__debug_phxvcn_stat);
         sysctl_unregister_oid(&sysctl__debug_phxmmvm);
@@ -1042,6 +1063,8 @@ IOReturn PhxBringup::adoptQueue(const uint64_t in[6]) {
         IOLockWakeup(gpuLock, &resumeEvent, false);
         IOLog("PhxBringup: resume: submissions released\n");
     }
+    if (qi == 1 && gFaultDef)
+        faultDefaultOn();
     if (qi == 1 && sleepRef) { sleepRef = false; gfxRelease(); }
     IOLockUnlock(gpuLock);
     IOLog("PhxBringup: adopted %s queue ring=+0x%llx (%llu dw) wptr=%llu doorbell=+0x%llx\n",
@@ -1239,6 +1262,40 @@ static uint64_t phxNowNs() {
     uint64_t ns;
     absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
     return ns;
+}
+
+// gpuLock held, GPU up: the GFX hub's protection-fault default page (see debug.phx_faultdef)
+void PhxBringup::faultDefaultOn() {
+    if (!gFaultPage) {
+        gFaultPage = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut | kIOMemoryPhysicallyContiguous,
+                                                                      4096, 0x00007FFFFFFFF000ull);
+        if (!gFaultPage || gFaultPage->prepare() != kIOReturnSuccess) {
+            OSSafeReleaseNULL(gFaultPage);
+            IOLog("PhxBringup: no page for the GFX fault default\n");
+            return;
+        }
+        bzero(gFaultPage->getBytesNoCopy(), 4096);
+    }
+    const uint64_t pa = gFaultPage->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
+    GfxGuard awake(this);
+    wreg(kRegFaultDefLo, static_cast<uint32_t>(pa >> 12));
+    wreg(kRegFaultDefHi, static_cast<uint32_t>(pa >> 44));
+    wreg(kRegFaultCntl, rreg(kRegFaultCntl) | kFaultEnableDefault);
+    wreg(kRegInvEng17Req, 0x00F80001u);   // VMID 0, every flush type
+    for (int i = 0; i < 1000 && !(rreg(kRegInvEng17Ack) & 1u); i++)
+        IODelay(1);
+    gFaultDefApplied++;
+    IOLog("PhxBringup: GFX fault default page 0x%llx, FAULT_CNTL 0x%x\n", pa, rreg(kRegFaultCntl));
+}
+
+int PhxBringup::gcFaultStat(char *b, size_t n) {
+    if (!mmio || !gpuReady())
+        return snprintf(b, n, "gpu not ready");
+    GfxGuard awake(this);
+    const uint32_t st = rreg(kRegFaultStatus);
+    return snprintf(b, n, "applied %u; FAULT_CNTL 0x%08x DEFAULT 0x%x_%08x; STATUS 0x%08x (vmid %u cid %u rw %u) ADDR 0x%x_%08x (page)",
+                    gFaultDefApplied, rreg(kRegFaultCntl), rreg(kRegFaultDefHi), rreg(kRegFaultDefLo), st, (st >> 20) & 15,
+                    (st >> 9) & 0x1ff, (st >> 18) & 1, rreg(kRegFaultAddrHi), rreg(kRegFaultAddrLo));
 }
 
 // gpuLock held (or no submitter left): the hardware state behind the VCN queue and the MMHUB setup is gone
@@ -1532,12 +1589,18 @@ IOReturn PhxBringup::gpuSubmitVcn(uint32_t handle, const uint64_t *ibVa, const u
     (void)*reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + q.ringOff);
     hdpFlush();
     wreg(kVcnRbWptr, static_cast<uint32_t>(q.wptr & (q.ringDw - 1)));
+    gVcnWptr = static_cast<uint32_t>(q.wptr & (q.ringDw - 1));
     OSIncrementAtomic64(&gVcnSubmits);
     IOLockUnlock(gpuLock);
     *seqOut = seq;
     return kIOReturnSuccess;
 }
 
+static int phxGcFaultStatSysctl SYSCTL_HANDLER_ARGS {
+    char b[256];
+    const int len = gPhx ? gPhx->gcFaultStat(b, sizeof b) : snprintf(b, sizeof b, "no PhxBringup");
+    return SYSCTL_OUT(req, b, static_cast<size_t>(len) + 1);
+}
 static int phxVcnSysctl SYSCTL_HANDLER_ARGS {
     int v = gVcnOn;
     const int err = sysctl_handle_int(oidp, &v, 0, req);
@@ -2256,6 +2319,8 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phx_hang_ms);
         sysctl_register_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_register_oid(&sysctl__debug_phx_faultdef);
+        sysctl_register_oid(&sysctl__debug_phx_gcfault_stat);
         sysctl_register_oid(&sysctl__debug_phxvcn);
         sysctl_register_oid(&sysctl__debug_phxvcn_stat);
         sysctl_register_oid(&sysctl__debug_phxmmvm);
