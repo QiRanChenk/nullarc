@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 40u
+#define PHX_KEXT_BUILD 41u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -91,6 +91,15 @@ static IOBufferMemoryDescriptor *gFaultPage;
 static uint32_t gFaultDefApplied;
 SYSCTL_INT(_debug, OID_AUTO, phx_faultdef, CTLFLAG_RW | CTLFLAG_LOCKED, &gFaultDef, 0,
            "1: give the GFX hub a protection-fault default page when the gfx queue is adopted");
+// debug.phx_vmwalk: the kext's own page-table walk for (debug.phx_vmwalk_vmid, debug.phx_vmwalk_va), next to what the
+// hub has for that VMID: tells a missing mapping (software) from a translation the hardware does not see
+static int gWalkVmid = 0;
+static SInt64 gWalkVa = 0;
+SYSCTL_INT(_debug, OID_AUTO, phx_vmwalk_vmid, CTLFLAG_RW | CTLFLAG_LOCKED, &gWalkVmid, 0, "hardware VMID for debug.phx_vmwalk");
+SYSCTL_QUAD(_debug, OID_AUTO, phx_vmwalk_va, CTLFLAG_RW | CTLFLAG_LOCKED, &gWalkVa, "GPU VA for debug.phx_vmwalk");
+static int phxVmWalkSysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, phx_vmwalk, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, phxVmWalkSysctl, "A",
+            "page-table walk of debug.phx_vmwalk_va in the context bound to debug.phx_vmwalk_vmid");
 static int phxGcFaultStatSysctl SYSCTL_HANDLER_ARGS;
 SYSCTL_PROC(_debug, OID_AUTO, phx_gcfault_stat, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, phxGcFaultStatSysctl, "A",
             "GFX hub protection fault registers");
@@ -267,6 +276,7 @@ public:
     uint64_t gpuRetired() const;
     void faultDefaultOn();
     int gcFaultStat(char *b, size_t n);
+    int vmWalk(char *b, size_t n);
     int vcnCtl(int v);
     int vcnStat(char *b, size_t n);
     int mmvmCtl(int v);
@@ -600,6 +610,9 @@ void PhxBringup::stop(IOService *provider) {
         sysctl_unregister_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_ms);
         sysctl_unregister_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_unregister_oid(&sysctl__debug_phx_vmwalk_vmid);
+        sysctl_unregister_oid(&sysctl__debug_phx_vmwalk_va);
+        sysctl_unregister_oid(&sysctl__debug_phx_vmwalk);
         sysctl_unregister_oid(&sysctl__debug_phx_faultdef);
         sysctl_unregister_oid(&sysctl__debug_phx_gcfault_stat);
         sysctl_unregister_oid(&sysctl__debug_phxvcn);
@@ -1302,6 +1315,35 @@ void PhxBringup::faultDefaultOn() {
     IOLog("PhxBringup: GFX fault default page 0x%llx, FAULT_CNTL 0x%x\n", pa, rreg(kRegFaultCntl));
 }
 
+int PhxBringup::vmWalk(char *b, size_t n) {
+    const uint32_t vmid = static_cast<uint32_t>(gWalkVmid);
+    const uint64_t va = static_cast<uint64_t>(gWalkVa) & 0x0000FFFFFFFFFFFFull;
+    if (!mmio || !gpuLock || vmid < kFirstUserVmid || vmid >= kFirstUserVmid + kNumUserVmids)
+        return snprintf(b, n, "set debug.phx_vmwalk_vmid (8..15) and debug.phx_vmwalk_va");
+    IOLockLock(gpuLock);
+    const uint32_t handle = hwv[vmid - kFirstUserVmid].ctx;
+    int o = snprintf(b, n, "vmid %u ctx %u va 0x%llx;", vmid, handle, va);
+    if (handle) {
+        const VmCtx &c = vm[handle - 1];
+        uint32_t regLo, regHi;
+        { GfxGuard awake(this); regLo = rreg(kRegCtx0BaseLo + 2 * vmid); regHi = rreg(kRegCtx0BaseLo + 2 * vmid + 1); }
+        o += snprintf(b + o, n - static_cast<size_t>(o), " root 0x%llx (hub base 0x%x_%08x, mm 0x%08x) used %u/%u;", c.phys, regHi, regLo,
+                      rreg(kMmCtx0BaseLo + 2 * vmid), c.used, c.pages);
+        uint64_t tbl = c.phys;
+        for (int shift = 39; shift >= 12 && static_cast<size_t>(o) < n; shift -= 9) {
+            const uint64_t *t = ptTable(c, tbl);
+            if (!t) { o += snprintf(b + o, n - static_cast<size_t>(o), " L%d table 0x%llx not ours", shift, tbl); break; }
+            const uint64_t e = t[(va >> shift) & 511];
+            o += snprintf(b + o, n - static_cast<size_t>(o), " L%d[%llu]=0x%llx", shift, (va >> shift) & 511, e);
+            if (!(e & 1))
+                break;
+            tbl = e & kPtAddrMask;
+        }
+    }
+    IOLockUnlock(gpuLock);
+    return o;
+}
+
 int PhxBringup::gcFaultStat(char *b, size_t n) {
     if (!mmio || !gpuReady())
         return snprintf(b, n, "gpu not ready");
@@ -1611,6 +1653,11 @@ IOReturn PhxBringup::gpuSubmitVcn(uint32_t handle, const uint64_t *ibVa, const u
     return kIOReturnSuccess;
 }
 
+static int phxVmWalkSysctl SYSCTL_HANDLER_ARGS {
+    char b[512];
+    const int len = gPhx ? gPhx->vmWalk(b, sizeof b) : snprintf(b, sizeof b, "no PhxBringup");
+    return SYSCTL_OUT(req, b, static_cast<size_t>(len) + 1);
+}
 static int phxGcFaultStatSysctl SYSCTL_HANDLER_ARGS {
     char b[384];
     const int len = gPhx ? gPhx->gcFaultStat(b, sizeof b) : snprintf(b, sizeof b, "no PhxBringup");
@@ -2334,6 +2381,9 @@ IOReturn PhxBringup::newUserClient(task_t owningTask, void *securityID, UInt32 t
         sysctl_register_oid(&sysctl__debug_phxbos_flush_bytes);
         sysctl_register_oid(&sysctl__debug_phx_hang_ms);
         sysctl_register_oid(&sysctl__debug_phx_hang_kills);
+        sysctl_register_oid(&sysctl__debug_phx_vmwalk_vmid);
+        sysctl_register_oid(&sysctl__debug_phx_vmwalk_va);
+        sysctl_register_oid(&sysctl__debug_phx_vmwalk);
         sysctl_register_oid(&sysctl__debug_phx_faultdef);
         sysctl_register_oid(&sysctl__debug_phx_gcfault_stat);
         sysctl_register_oid(&sysctl__debug_phxvcn);
