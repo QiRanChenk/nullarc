@@ -330,6 +330,16 @@ class PhxAMDFB : public IOFramebuffer {
         fRefreshMilliHz = mhz; fHTotal = ht; fVTotal = vt;
         fFrameNs = 1000000000000ull / mhz;
         PFBLOG("refresh: OTG0 %ux%u totals, %u frames in %llu us -> %u.%03u Hz", ht, vt, frames, ns / 1000, mhz / 1000, mhz % 1000);
+        // boot-arg phxvbldiv=N (2..4): the panel keeps scanning at its rate, but the VBL timer ticks every Nth refresh
+        // and the mode reports rate / N, so WindowServer and the apps render 1/N as many frames (every frame is a
+        // full-screen CPU copy here: 120 of them a second at 3840x2400 while a video plays cost a quarter of a core
+        // in the display pipe alone, 2026-11-25).
+        uint32_t div = 1;
+        if (PE_parse_boot_argn("phxvbldiv", &div, sizeof div) && div >= 2 && div <= 4 && mhz / div >= 24000) {
+            fRefreshMilliHz = mhz / div;
+            fFrameNs = 1000000000000ull / fRefreshMilliHz;
+            PFBLOG("refresh: phxvbldiv=%u -> reporting %u.%03u Hz", div, fRefreshMilliHz / 1000, fRefreshMilliHz % 1000);
+        }
     }
 
 public:
