@@ -25,7 +25,7 @@
 #include "PhxNativeABI.h"
 #include "../amd/phx_smu_pm.h"
 
-#define PHX_KEXT_BUILD 46u
+#define PHX_KEXT_BUILD 47u
 
 // debug.phxbos_flush: how a client's BOs are made coherent around each submission and each completed wait.
 // 2 = clflush every line (the bring-up way), 1 = clflushopt (the same lines, pipelined), 0 = none (the GPU maps system
@@ -373,6 +373,11 @@ private:
     };
     GpuQueue gq[3]{};   // compute, gfx, VCN0 (unified ring)
     uint64_t gSeq{0};
+    // The newest sequence whose queue entry is in place. gpuRetiredMask reads without the lock and used to start from
+    // gSeq, which a submitter raises before it writes the entry and moves the tail: a wait that polled in between
+    // saw empty queues and reported the new sequence as retired. The client then took the job for finished while it
+    // had not started (video: FFmpeg reused the bitstream and command buffers of a queued decode; build 47).
+    volatile uint64_t gSeqPub{0};
     uint64_t queueFence(const GpuQueue &q) const;
     IOLock *gpuLock{nullptr};
     // One GPUVM context (page tables) per client, and the eight hardware VMIDs lent to contexts at submission time,
@@ -1219,7 +1224,7 @@ uint64_t PhxBringup::queueFence(const GpuQueue &q) const {
 uint64_t PhxBringup::gpuRetiredMask(uint32_t qmask) const {
     if (suspended)
         return retiredAtSleep;   // the fences are in VRAM, which is gone until the queues are adopted again
-    uint64_t r = gSeq;
+    uint64_t r = gSeqPub;   // read before the queues: every entry up to it is visible below
     for (uint32_t qi = 0; qi < 3; qi++) {
         const GpuQueue &q = gq[qi];
         if (!q.ready || !(qmask & (1u << qi)))
@@ -1361,6 +1366,8 @@ IOReturn PhxBringup::gpuSubmit(uint32_t handle, bool gfx, const uint64_t *ibVa, 
     q.fvmid[q.tail & 63] = vmid;
     __asm__ __volatile__("" ::: "memory");
     q.tail = q.tail + 1;
+    __asm__ __volatile__("" ::: "memory");
+    gSeqPub = seq;
     // BAR0 is write-combined: drain the WC buffers so the packets are in VRAM before the CP is told about them
     __asm__ __volatile__("sfence" ::: "memory");
     (void)*reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + q.ringOff);
@@ -1748,6 +1755,8 @@ IOReturn PhxBringup::gpuSubmitVcn(uint32_t handle, const uint64_t *ibVa, const u
     gVcnSubAbs[q.tail & 63] = mach_absolute_time();
     __asm__ __volatile__("" ::: "memory");
     q.tail = q.tail + 1;
+    __asm__ __volatile__("" ::: "memory");
+    gSeqPub = seq;
     __asm__ __volatile__("sfence" ::: "memory");
     (void)*reinterpret_cast<volatile uint32_t *>(fbAper->getVirtualAddress() + q.ringOff);
     hdpFlush();
