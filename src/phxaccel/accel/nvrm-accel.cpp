@@ -1048,6 +1048,7 @@ extern uint64_t gPhxVblLastAbs[], gPhxFrameAbs[];   // per head (phxfb.cpp, kPhx
 static uint64_t gIopLastAbs[kNvMaxFB];
 static SInt64 gCntIopGap[4], gIopPhaseUsSum;
 static int gIopSse = 0;   // debug.nvaccel_iop_sse
+static int gIopSkipCopy = 0;   // debug.nvaccel_iop_skipcopy: measurement only, the panel keeps its last frame
 
 // One row of a copied frame in 64-byte steps: SSE4.1 streaming loads (movntdqa) and non-temporal stores (movntdq).
 // Some of WindowServer's display surfaces are write-combined, and plain loads read those at ~0.5 GB/s: a frame from
@@ -1229,7 +1230,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
     // DRAM under it, in stripes (2026-10-20). Through the BAR (uncached) they behave as plain stores.
     const bool wide = ((((uintptr_t)src | (uintptr_t)d) & 7) == 0) && !(spr & 1) && !(dpr & 1);
     const bool sse = gIopSse && ((((uintptr_t)src | (uintptr_t)d) & 15) == 0) && !(spr & 3) && !(dpr & 3);
-    for (unsigned y = 0; y < h; y++) {
+    for (unsigned y = 0; y < (gIopSkipCopy ? 0u : h); y++) {
         const volatile unsigned int *sp = src + (unsigned long)y * spr;
         volatile unsigned int *dp = d + (unsigned long)y * dpr;
         unsigned x = 0;
@@ -1360,6 +1361,7 @@ NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied who
 static SInt64 gCntIopCopySkip;
 NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_bench, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopBench, 0, "1 = time a read-only pass over the next copied frame's source (nvaccel_iop_read_us)");
+SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_skipcopy, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopSkipCopy, 0, "1 = frames are not copied to the panel (it keeps the last one): measures what the copy costs");
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_sse, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopSse, 0, "1 = copy frames with SSE4.1 streaming loads (fast from write-combined surfaces), 0 = 8-byte loads (default until proven)");
 NVACCEL_CNT(nvaccel_iop_read_us,      gIopReadUs,         "the last bench: microseconds to read one frame's source");
 NVACCEL_CNT(nvaccel_iop_copy_us,      gIopCopyUs,         "microseconds the last copied frame took");
@@ -1519,7 +1521,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_bench);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_read_us);
-    sysctl_register_oid(&sysctl__debug_nvaccel_iop_sse);
+    sysctl_register_oid(&sysctl__debug_nvaccel_iop_sse); sysctl_register_oid(&sysctl__debug_nvaccel_iop_skipcopy);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_us);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_us_max);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_us_sum);
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_gap1);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_gap2);
