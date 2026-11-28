@@ -1,0 +1,37 @@
+From 4a42e67beeb6ad5a84c80865707e19bfb48c5ba1 Mon Sep 17 00:00:00 2001
+From: QiRanChenk <12079860+QiRanChenk@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:22:24 +0800
+Subject: [PATCH 2/2] h264: one picture out per access unit with
+ AV_CODEC_FLAG_LOW_DELAY (phxdec)
+
+---
+ libavcodec/h264_slice.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index a66b75c..bc9b893 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -1320,6 +1320,19 @@ static int h264_select_output_frame(H264Context *h)
+         h->avctx->has_b_frames = out_of_order;
+     }
+ 
++    /* PHX: with AV_CODEC_FLAG_LOW_DELAY every picture is output as soon as it is decoded, in decode order, as a
++     * VideoToolbox decoder must emit one frame per sample before DecodeFrame returns (has_b_frames above still tells
++     * the caller the reorder depth). */
++    if (h->avctx->flags & AV_CODEC_FLAG_LOW_DELAY) {
++        h->frame_recovered |= cur->recovered;
++        cur->recovered |= h->frame_recovered & FRAME_RECOVERED_SEI;
++        if (!cur->recovered)
++            cur->f->flags |= AV_FRAME_FLAG_CORRUPT;
++        h->next_output_pic = cur;
++        h->next_outputed_poc = cur->poc;
++        return 0;
++    }
++
+     pics = 0;
+     while (h->delayed_pic[pics])
+         pics++;
+-- 
+2.50.1 (Apple Git-155)
+

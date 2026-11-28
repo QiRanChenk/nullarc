@@ -1,0 +1,31 @@
+From bc3bb89afb117922a1f8ce4854f3d6d73f039451 Mon Sep 17 00:00:00 2001
+From: QiRanChenk <12079860+QiRanChenk@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 17:52:25 +0800
+Subject: [PATCH 3/3] radv/darwin (phxdec build): no compute or transfer queue
+ family
+
+---
+ src/amd/vulkan/radv_instance.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/amd/vulkan/radv_instance.c b/src/amd/vulkan/radv_instance.c
+index 8d42262..b2c8ae1 100644
+--- a/src/amd/vulkan/radv_instance.c
++++ b/src/amd/vulkan/radv_instance.c
+@@ -280,6 +280,13 @@ radv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationC
+    instance->trap_excp_flags = parse_debug_string(os_get_option("RADV_TRAP_HANDLER_EXCP"), radv_trap_excp_options);
+    instance->profile_pstate = radv_parse_pstate(debug_get_option("RADV_PROFILE_PSTATE", "peak"));
+    instance->queue_disable_flags = parse_debug_string(os_get_option("RADV_QUEUE_DISABLE"), radv_queue_disable_options);
++#ifdef __APPLE__
++   /* phxdec build (Phoenix, PhxBringup): everything goes through the general queue. The compute queue of the kext is
++    * not used by anything else here and did not survive an idle period: the second process to submit to it hung
++    * (2026-11-25). RADV_DARWIN_ALL_QUEUES=1 brings the compute and transfer families back. */
++   if (!os_get_option("RADV_DARWIN_ALL_QUEUES"))
++      instance->queue_disable_flags |= RADV_QUEUE_DISABLE_COMPUTE | RADV_QUEUE_DISABLE_TRANSFER;
++#endif
+ 
+    const bool has_shader_stage_flags =
+       RADV_DEBUG(instance, DUMP_VS) || RADV_DEBUG(instance, DUMP_TCS) || RADV_DEBUG(instance, DUMP_TES) ||
+-- 
+2.50.1 (Apple Git-155)
+

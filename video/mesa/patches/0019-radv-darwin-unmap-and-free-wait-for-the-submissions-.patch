@@ -1,0 +1,78 @@
+From 9682d65f0d13bad229569bd33058711123ee7a1d Mon Sep 17 00:00:00 2001
+From: QiRanChenk <12079860+QiRanChenk@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 17:02:36 +0800
+Subject: [PATCH 2/3] radv/darwin: unmap and free wait for the submissions of
+ this process (the kext does not keep in-flight BOs alive)
+
+---
+ src/amd/common/darwin/ac_darwin_drm.c | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index f11f93f..573e0de 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -4,6 +4,7 @@
+  * Darwin backend of the ac_drm_* layer.  See ac_darwin_drm.h.
+  */
+ 
++#include <stdatomic.h>
+ #include "ac_darwin_drm.h"
+ #include "ac_darwin_kext.h"
+ #include "ac_darwin_budget.h"
+@@ -73,6 +74,11 @@ struct acd_core {
+    uint32_t minor; /* ABI minor the kernel reported */
+    bool shared; /* the process-wide core (false: the private HOST_BO stand-in core) */
+    bool used_vcn;
++   /* The newest sequence number this process submitted, and the newest one seen retired. The kext unmaps and frees
++    * at once (Linux keeps a BO alive while a job references it), and RADV frees some BOs right after a submit (queue
++    * preamble IBs when they are rebuilt): with other clients' work queued ahead, the CP then fetched an unmapped IB
++    * and the GFX hub faulted (2026-11-25, FFmpeg's Vulkan transfers). Unmap and free wait for last_seq first. */
++   _Atomic uint64_t last_seq, retired_seq;
+    struct acd_kext *kext; /* NULL in the HOST_BO stand-in */
+    struct amdgpu_va_manager *va_mgr;
+    struct util_sync_provider *sync; /* master; every device holds a clone */
+@@ -638,9 +644,24 @@ bo_lookup(struct acd_device *dev, uint32_t handle)
+ 
+ /* ---- DRM_AMDGPU_* command emulation ---- */
+ 
++static void
++acd_wait_inflight(struct acd_device *dev)
++{
++   struct acd_core *c = dev->core;
++   const uint64_t last = atomic_load(&c->last_seq);
++   if (!c->kext || !last || atomic_load(&c->retired_seq) >= last)
++      return;
++   bool busy = false;
++   /* bounded: a hung queue must not block the process forever (the kext's watchdog deals with it) */
++   if (!acd_kext_wait_deadline(c->kext, last, acd_kext_now_ns(c->kext) + 2000000000ull, &busy) && !busy)
++      atomic_store(&c->retired_seq, last);
++}
++
+ static int
+ acd_cmd_gem_va(struct acd_device *dev, struct drm_amdgpu_gem_va *va)
+ {
++   if (va->operation == AMDGPU_VA_OP_UNMAP)
++      acd_wait_inflight(dev);
+    /* Mesa consumes the syncobj fields (contract 7): the wait first, the signal after. */
+    if (va->num_syncobj_handles && va->input_fence_syncobj_handles) {
+       int r = dev->sync->wait(dev->sync, (uint32_t *)(uintptr_t)va->input_fence_syncobj_handles,
+@@ -703,6 +724,7 @@ acd_cmd_cs(struct acd_device *dev, union drm_amdgpu_cs *cs)
+    acd_cs_plan_fini(&plan);
+    if (r)
+       return r;
++   atomic_store(&dev->core->last_seq, seq);
+    memset(&cs->out, 0, sizeof(cs->out));
+    cs->out.handle = seq;
+    return 0;
+@@ -961,6 +983,7 @@ acd_bo_free(acd_device_handle dev, amdgpu_bo_handle bo)
+       return 0;
+    }
+    int r = 0;
++   acd_wait_inflight(dev);
+    /* the CPU mapping goes first (contract 3.4); the kext then frees the BO.  A userptr BO's cpu is the caller's own pointer: nothing to unmap. */
+    if (bo->cpu && !bo->userptr) {
+       r = acd_kext_bo_unmap(dev->core->kext, bo->handle, bo->cpu);
+-- 
+2.50.1 (Apple Git-155)
+

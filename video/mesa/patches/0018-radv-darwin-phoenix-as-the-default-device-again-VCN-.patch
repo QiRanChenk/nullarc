@@ -1,0 +1,54 @@
+From 017f9d402b664ec874c91ae90adffb424ce6c617 Mon Sep 17 00:00:00 2001
+From: QiRanChenk <12079860+QiRanChenk@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 16:15:53 +0800
+Subject: [PATCH 1/3] radv/darwin: phoenix as the default device again; VCN
+ 4.0.2 (Vulkan Video) on phoenix
+
+---
+ src/amd/common/darwin/ac_darwin_drm.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/src/amd/common/darwin/ac_darwin_drm.c b/src/amd/common/darwin/ac_darwin_drm.c
+index 0577685..f11f93f 100644
+--- a/src/amd/common/darwin/ac_darwin_drm.c
++++ b/src/amd/common/darwin/ac_darwin_drm.c
+@@ -107,7 +107,7 @@ const struct amdgpu_device *
+ acd_canned_device(void)
+ {
+    const char *name = getenv("RADV_DARWIN_CANNED");
+-   return find_canned(name && *name ? name : "navi31_xt");   /* navi31 fork: RX 7900 XT */
++   return find_canned(name && *name ? name : "phoenix");
+ }
+ 
+ uint32_t
+@@ -491,7 +491,7 @@ acd_info_memory(struct acd_device *dev, const struct drm_amdgpu_info *info, void
+ static bool
+ acd_vcn(const struct acd_device *dev)
+ {
+-   if (!dev->core->kext || strcmp(dev->canned->name, "navi31_xt"))
++   if (!dev->core->kext || (strcmp(dev->canned->name, "navi31_xt") && strcmp(dev->canned->name, "phoenix")))
+       return false;
+    if (env_is_1("RADV_DARWIN_VCN"))
+       return true;
+@@ -548,7 +548,8 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+             .ib_start_alignment = 256,
+             .ib_size_alignment = 4,
+             .available_rings = 1,
+-            .ip_discovery_version = 0x040000,
++            /* phoenix VCN 4.0.2, navi31 VCN 4.0.0 */
++            .ip_discovery_version = !strcmp(dev->canned->name, "phoenix") ? 0x040002 : 0x040000,
+          };
+       return 0;
+    case AMDGPU_INFO_HW_IP_COUNT:
+@@ -562,7 +563,7 @@ acd_info(struct acd_device *dev, const struct drm_amdgpu_info *info)
+       else if (info->query_fw.fw_type == AMDGPU_INFO_FW_GFX_MEC)
+          *(struct drm_amdgpu_info_firmware *)out = d->fw_gfx_mec;
+       else if (info->query_fw.fw_type == AMDGPU_INFO_FW_VCN)
+-         *(struct drm_amdgpu_info_firmware *)out = (struct drm_amdgpu_info_firmware){.ver = 0x09118016};
++         *(struct drm_amdgpu_info_firmware *)out = (struct drm_amdgpu_info_firmware){.ver = !strcmp(dev->canned->name, "phoenix") ? 0x09118022 : 0x09118016};
+       return 0;
+    case AMDGPU_INFO_READ_MMR_REG:
+       info_read_mmr_reg(d, info->read_mmr_reg.dword_offset, info->read_mmr_reg.count,
+-- 
+2.50.1 (Apple Git-155)
+

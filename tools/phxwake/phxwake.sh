@@ -21,3 +21,5 @@ sysctl -w debug.nvaccelfb=9 >/dev/null
 $P smu 0x1b 800 | tail -1
 if [ -x /usr/local/libexec/gpucg.sh ] && [ ! -e $G/gpucg-off ]; then /usr/local/libexec/gpucg.sh all; fi
 echo "done in $(( $(date +%s) - t0 )) s: GRBM_STATUS $($P regs 0x2004 | awk '{print $2}'), frames $(sysctl -n debug.nvaccel_iop_ok)"
+# VCN (video decode) is brought up again the same way: /Users/Shared/gpu/vcnup/vcnwake.sh
+[ -f $G/vcnup/vcnwake.sh ] && bash $G/vcnup/vcnwake.sh
